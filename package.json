@@ -1,0 +1,37 @@
+{
+  "name": "@syc-tech/qrmesh",
+  "version": "0.1.0",
+  "description": "TCP-like protocol for peer-to-peer communication over QR codes",
+  "type": "module",
+  "main": "index.ts",
+  "types": "index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": [
+    "*.ts"
+  ],
+  "keywords": [
+    "qr",
+    "qrcode",
+    "tcp",
+    "mesh",
+    "p2p",
+    "peer-to-peer",
+    "web-component"
+  ],
+  "author": "syc-tech",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/syc-tech/qrmesh.git"
+  },
+  "peerDependencies": {
+    "jsqr": "^1.4.0",
+    "qrcode": "^1.5.0"
+  },
+  "devDependencies": {
+    "@types/qrcode": "^1.5.0",
+    "typescript": "^5.0.0"
+  }
+}
