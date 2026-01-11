@@ -6,11 +6,18 @@
   "main": "index.ts",
   "types": "index.ts",
   "exports": {
-    ".": "./index.ts"
+    ".": "./index.ts",
+    "./chat": "./demo/chat.ts"
   },
   "files": [
-    "*.ts"
+    "*.ts",
+    "demo/*.ts"
   ],
+  "scripts": {
+    "build:demo": "esbuild demo/chat.ts --bundle --outfile=dist/chat.js --format=esm --target=es2020 --minify",
+    "build": "npm run build:demo && cp demo/index.html dist/",
+    "dev": "esbuild demo/chat.ts --bundle --outfile=dist/chat.js --format=esm --target=es2020 --servedir=dist --serve=8080"
+  },
   "keywords": [
     "qr",
     "qrcode",
@@ -18,7 +25,8 @@
     "mesh",
     "p2p",
     "peer-to-peer",
-    "web-component"
+    "web-component",
+    "chat"
   ],
   "author": "syc-tech",
   "license": "MIT",
@@ -30,8 +38,13 @@
     "jsqr": "^1.4.0",
     "qrcode": "^1.5.0"
   },
+  "dependencies": {
+    "jsqr": "^1.4.0",
+    "qrcode": "^1.5.0"
+  },
   "devDependencies": {
     "@types/qrcode": "^1.5.0",
+    "esbuild": "^0.20.0",
     "typescript": "^5.0.0"
   }
 }
