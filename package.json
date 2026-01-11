@@ -14,9 +14,9 @@
     "demo/*.ts"
   ],
   "scripts": {
-    "build:demo": "esbuild demo/chat.ts --bundle --outfile=dist/chat.js --format=esm --target=es2020 --minify",
-    "build": "npm run build:demo && cp demo/index.html dist/",
-    "dev": "esbuild demo/chat.ts --bundle --outfile=dist/chat.js --format=esm --target=es2020 --servedir=dist --serve=8080"
+    "build:demo": "esbuild demo/chat.ts --bundle --outfile=docs/chat.js --format=esm --target=es2020 --minify",
+    "build": "npm run build:demo && cp demo/index.html docs/",
+    "dev": "esbuild demo/chat.ts --bundle --outfile=docs/chat.js --format=esm --target=es2020 --servedir=docs --serve=8080"
   },
   "keywords": [
     "qr",
