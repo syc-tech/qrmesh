@@ -65,7 +65,7 @@ export class QRScanner {
     this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
 
     const videoConstraints = {
-      facingMode: constraints?.facingMode ?? 'environment',
+      facingMode: constraints?.facingMode ?? 'user',
       width: constraints?.width ?? { ideal: 1280 },
       height: constraints?.height ?? { ideal: 720 },
     };
