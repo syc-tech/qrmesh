@@ -79,16 +79,16 @@ const styles = `
   .qr-area {
     background: white;
     border-radius: 0.5rem;
-    padding: 1rem;
+    padding: 0.5rem;
     display: flex;
     justify-content: center;
     align-items: center;
-    min-height: 300px;
+    min-height: 420px;
   }
 
   .qr-area canvas {
-    max-width: 280px;
-    max-height: 280px;
+    max-width: 400px;
+    max-height: 400px;
   }
 
   .camera-area {
@@ -192,6 +192,12 @@ const styles = `
   @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.5; }
+  }
+
+  .status-dot.flash {
+    background: #22c55e !important;
+    transform: scale(1.5);
+    transition: transform 0.1s;
   }
 
   .device-info {
@@ -442,12 +448,13 @@ export class QRMeshChatElement extends HTMLElement {
   private keyPair: KeyPair | null = null;
   private mesh: MeshState | null = null;
   private scanner: QRScanner | null = null;
-  private qrInterval: ReturnType<typeof setInterval> | null = null;
   private retryInterval: ReturnType<typeof setInterval> | null = null;
   private activePeerId: string | null = null;
   private messageQueue: QueuedMessage[] = [];
   private sentMessages: Array<{ text: string; timestamp: number; pn?: number }> = [];
   private receivedMessages: Array<{ text: string; timestamp: number }> = [];
+  private lastDisplayedPacket: string | null = null;
+  private scanFlashTimeout: ReturnType<typeof setTimeout> | null = null;
 
   // DOM refs
   private qrCanvas: HTMLCanvasElement | null = null;
@@ -473,8 +480,8 @@ export class QRMeshChatElement extends HTMLElement {
   }
 
   disconnectedCallback() {
-    if (this.qrInterval) clearInterval(this.qrInterval);
     if (this.retryInterval) clearInterval(this.retryInterval);
+    if (this.scanFlashTimeout) clearTimeout(this.scanFlashTimeout);
     this.scanner?.stop();
   }
 
@@ -494,14 +501,20 @@ export class QRMeshChatElement extends HTMLElement {
       this.mesh = new MeshState(this.keyPair, { deviceName: 'Chat Demo' });
       this.mesh.subscribe((event) => this.handleMeshEvent(event));
 
-      this.qrInterval = setInterval(() => this.updateQR(), 800);
+      // Show initial beacon QR (static until activity)
+      this.updateQR();
+
       this.retryInterval = setInterval(() => {
         this.mesh?.checkRetries();
         this.processMessageQueue();
         this.updateDeliveryStatus();
+        // Only update QR if there are pending packets
+        if (this.hasPendingPackets()) {
+          this.updateQR();
+        }
       }, 1000);
 
-      this.updateStatus('Ready', 'idle');
+      this.updateStatus('Beacon ready', 'idle');
     } catch (e) {
       console.error('Init failed:', e);
       this.updateStatus('Init failed', 'error');
@@ -577,10 +590,16 @@ export class QRMeshChatElement extends HTMLElement {
 
     const packet = this.mesh.getNextOutgoingPacket();
     if (packet) {
+      const encoded = encodePacket(packet);
+
+      // Only redraw if packet changed
+      if (encoded === this.lastDisplayedPacket) return;
+      this.lastDisplayedPacket = encoded;
+
       try {
-        await QRCode.toCanvas(this.qrCanvas, encodePacket(packet), {
-          width: 280,
-          margin: 2,
+        await QRCode.toCanvas(this.qrCanvas, encoded, {
+          width: 400,
+          margin: 1,
           errorCorrectionLevel: 'L',
           color: { dark: '#000', light: '#fff' },
         });
@@ -619,6 +638,9 @@ export class QRMeshChatElement extends HTMLElement {
     const packet = decodePacket(data);
     if (!packet) return;
 
+    // Flash the status to indicate scan
+    this.flashScanIndicator();
+
     if (packet.t === PACKET_TYPES.BEACON) {
       this.mesh.processBeacon(packet);
       // Auto-select peer when discovered
@@ -630,6 +652,29 @@ export class QRMeshChatElement extends HTMLElement {
     } else {
       this.mesh.processPacket(packet);
     }
+
+    // Update QR after receiving a packet (may need to send response)
+    this.updateQR();
+  }
+
+  private flashScanIndicator() {
+    if (this.statusDot) {
+      this.statusDot.classList.add('flash');
+      if (this.scanFlashTimeout) clearTimeout(this.scanFlashTimeout);
+      this.scanFlashTimeout = setTimeout(() => {
+        this.statusDot?.classList.remove('flash');
+      }, 300);
+    }
+    this.updateStatus('Scanned!', 'scanning');
+  }
+
+  private hasPendingPackets(): boolean {
+    if (!this.mesh) return false;
+    for (const peer of this.mesh.getPeers()) {
+      const status = this.mesh.getDeliveryStatus(peer.id);
+      if (status.pending.length > 0) return true;
+    }
+    return false;
   }
 
   private queueMessage(text: string) {

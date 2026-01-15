@@ -71,8 +71,8 @@ const styles = `
   }
 
   .qr-container canvas {
-    max-width: 280px;
-    max-height: 280px;
+    max-width: 400px;
+    max-height: 400px;
   }
 
   .video-container {
@@ -441,8 +441,8 @@ export class QRTCPDemoElement extends HTMLElement {
       const data = encodePacket(packet);
       try {
         await QRCode.toCanvas(this.qrCanvas, data, {
-          width: 280,
-          margin: 2,
+          width: 400,
+          margin: 1,
           errorCorrectionLevel: 'L',
         });
         this.mesh.markPacketDisplayed(packet);

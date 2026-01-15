@@ -9,7 +9,7 @@
  */
 
 export const PROTOCOL_VERSION = 3;
-export const PROTOCOL_PREFIX = 'Q3';
+export const PROTOCOL_PREFIX = 'Q';
 export const BROADCAST_ADDR = '*';
 
 // Packet types (single char)
@@ -96,34 +96,26 @@ function decodeAcks(str: string): AckRange[] {
  * Encode packet to compact string
  */
 export function encodePacket(packet: QRPacket): string {
-  const parts: string[] = [PROTOCOL_PREFIX];
-
   switch (packet.t) {
     case PACKET_TYPES.BEACON:
-      // Q3|B|{id}|{name}
-      parts.push('B', packet.src, packet.name || '');
-      break;
+      // Minimal: QB{id} (just 10 chars for 8-char ID)
+      return `QB${packet.src}`;
 
     case PACKET_TYPES.INITIAL:
-      // Q3|I|{src}|{dst}|{pn}|{key}|{name}|{acks}
-      parts.push('I', packet.src, packet.dst, String(packet.pn),
-        packet.key || '', packet.name || '', encodeAcks(packet.acks || []));
-      break;
+      // QI{src}{dst}{pn}|{key}|{name}|{acks}
+      return `QI${packet.src}${packet.dst}${packet.pn}|${packet.key || ''}|${packet.name || ''}|${encodeAcks(packet.acks || [])}`;
 
     case PACKET_TYPES.DATA:
-      // Q3|D|{src}|{dst}|{pn}|{mt}|{payload}|{acks}
-      parts.push('D', packet.src, packet.dst, String(packet.pn),
-        packet.mt || '', packet.payload || '', encodeAcks(packet.acks || []));
-      break;
+      // QD{src}{dst}{pn}{mt}|{payload}|{acks}
+      return `QD${packet.src}${packet.dst}${packet.pn}${packet.mt || ''}|${packet.payload || ''}|${encodeAcks(packet.acks || [])}`;
 
     case PACKET_TYPES.ACK:
-      // Q3|A|{src}|{dst}|{pn}|{acks}
-      parts.push('A', packet.src, packet.dst, String(packet.pn),
-        encodeAcks(packet.acks || []));
-      break;
-  }
+      // QA{src}{dst}{pn}|{acks}
+      return `QA${packet.src}${packet.dst}${packet.pn}|${encodeAcks(packet.acks || [])}`;
 
-  return parts.join('|');
+    default:
+      return '';
+  }
 }
 
 /**
@@ -131,61 +123,81 @@ export function encodePacket(packet: QRPacket): string {
  */
 export function decodePacket(data: string): QRPacket | null {
   try {
-    if (!data.startsWith(PROTOCOL_PREFIX + '|')) {
-      return null;
-    }
+    if (!data.startsWith('Q')) return null;
 
-    const parts = data.split('|');
-    const type = parts[1] as PacketType;
+    const type = data[1] as PacketType;
 
     switch (type) {
       case PACKET_TYPES.BEACON:
-        // Q3|B|{id}|{name}
+        // QB{id} - 10 chars total
         return {
           v: PROTOCOL_VERSION,
           t: PACKET_TYPES.BEACON,
-          src: parts[2],
+          src: data.slice(2, 10),
           dst: BROADCAST_ADDR,
           pn: 0,
-          name: parts[3] || undefined,
         };
 
-      case PACKET_TYPES.INITIAL:
-        // Q3|I|{src}|{dst}|{pn}|{key}|{name}|{acks}
+      case PACKET_TYPES.INITIAL: {
+        // QI{src:8}{dst:8}{pn}|{key}|{name}|{acks}
+        const src = data.slice(2, 10);
+        const dst = data.slice(10, 18);
+        const rest = data.slice(18);
+        const pnEnd = rest.indexOf('|');
+        const pn = Number(rest.slice(0, pnEnd));
+        const parts = rest.slice(pnEnd + 1).split('|');
         return {
           v: PROTOCOL_VERSION,
           t: PACKET_TYPES.INITIAL,
-          src: parts[2],
-          dst: parts[3],
-          pn: Number(parts[4]),
-          key: parts[5] || undefined,
-          name: parts[6] || undefined,
-          acks: decodeAcks(parts[7]),
+          src,
+          dst,
+          pn,
+          key: parts[0] || undefined,
+          name: parts[1] || undefined,
+          acks: decodeAcks(parts[2]),
         };
+      }
 
-      case PACKET_TYPES.DATA:
-        // Q3|D|{src}|{dst}|{pn}|{mt}|{payload}|{acks}
+      case PACKET_TYPES.DATA: {
+        // QD{src:8}{dst:8}{pn}{mt:1}|{payload}|{acks}
+        const src = data.slice(2, 10);
+        const dst = data.slice(10, 18);
+        const rest = data.slice(18);
+        const pipeIdx = rest.indexOf('|');
+        const pnAndMt = rest.slice(0, pipeIdx);
+        // mt is single char at end if present
+        const mt = pnAndMt.match(/[A-Z]$/) ? pnAndMt.slice(-1) as MessageType : undefined;
+        const pn = Number(mt ? pnAndMt.slice(0, -1) : pnAndMt);
+        const parts = rest.slice(pipeIdx + 1).split('|');
         return {
           v: PROTOCOL_VERSION,
           t: PACKET_TYPES.DATA,
-          src: parts[2],
-          dst: parts[3],
-          pn: Number(parts[4]),
-          mt: (parts[5] as MessageType) || undefined,
-          payload: parts[6] || undefined,
-          acks: decodeAcks(parts[7]),
+          src,
+          dst,
+          pn,
+          mt,
+          payload: parts[0] || undefined,
+          acks: decodeAcks(parts[1]),
         };
+      }
 
-      case PACKET_TYPES.ACK:
-        // Q3|A|{src}|{dst}|{pn}|{acks}
+      case PACKET_TYPES.ACK: {
+        // QA{src:8}{dst:8}{pn}|{acks}
+        const src = data.slice(2, 10);
+        const dst = data.slice(10, 18);
+        const rest = data.slice(18);
+        const pipeIdx = rest.indexOf('|');
+        const pn = Number(rest.slice(0, pipeIdx));
+        const acks = decodeAcks(rest.slice(pipeIdx + 1));
         return {
           v: PROTOCOL_VERSION,
           t: PACKET_TYPES.ACK,
-          src: parts[2],
-          dst: parts[3],
-          pn: Number(parts[4]),
-          acks: decodeAcks(parts[5]),
+          src,
+          dst,
+          pn,
+          acks,
         };
+      }
 
       default:
         return null;
