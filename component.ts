@@ -1,7 +1,7 @@
 /**
- * QR-TCP Demo Web Component
+ * QR-QUIC Demo Web Component
  *
- * A framework-agnostic custom element that provides the full QR-TCP demo UI.
+ * A framework-agnostic custom element that provides the full QR-QUIC demo UI.
  * Usage: <qrtcp-demo></qrtcp-demo>
  *
  * Can be used in any framework (React, Vue, Angular, Svelte) or plain HTML.
@@ -11,7 +11,7 @@ import QRCode from 'qrcode';
 import { getOrCreateKeyPair, type KeyPair, type KeyStorage } from './crypto';
 import { encodePacket, decodePacket, MESSAGE_TYPES, type QRPacket } from './protocol';
 import { QRScanner } from './scanner';
-import { MeshState, ConnectionState, type MeshEvent } from './mesh';
+import { MeshState, type MeshEvent, type Peer } from './mesh';
 
 // Styles for the component (scoped via Shadow DOM)
 const styles = `
@@ -71,8 +71,8 @@ const styles = `
   }
 
   .qr-container canvas {
-    max-width: 200px;
-    max-height: 200px;
+    max-width: 280px;
+    max-height: 280px;
   }
 
   .video-container {
@@ -196,15 +196,32 @@ const styles = `
     margin-left: 0.5rem;
   }
 
-  .state-connected { color: #4ade80; }
-  .state-connecting { color: #facc15; }
-  .state-disconnected { color: #94a3b8; }
+  .state-active { color: #4ade80; }
+  .state-discovered { color: #facc15; }
   .state-error { color: #f87171; }
 
   .peer-actions {
     display: flex;
     gap: 0.5rem;
   }
+
+  .delivery-status {
+    display: flex;
+    gap: 0.25rem;
+    align-items: center;
+    font-size: 0.75rem;
+    margin-left: 0.5rem;
+  }
+
+  .delivery-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+  }
+
+  .delivery-dot.pending { background: #f59e0b; }
+  .delivery-dot.acked { background: #10b981; }
+  .delivery-dot.failed { background: #ef4444; }
 
   .chat-container {
     background: #0f172a;
@@ -242,11 +259,25 @@ const styles = `
     background: #334155;
   }
 
+  .chat-bubble.pending {
+    background: #1e3a5f;
+    border: 1px dashed #3b82f6;
+  }
+
   .encrypted-badge {
     color: #4ade80;
     font-size: 0.75rem;
     margin-left: 0.25rem;
   }
+
+  .status-icon {
+    font-size: 0.75rem;
+    margin-left: 0.25rem;
+  }
+
+  .status-icon.pending { color: #f59e0b; }
+  .status-icon.acked { color: #10b981; }
+  .status-icon.failed { color: #ef4444; }
 
   .chat-input {
     display: flex;
@@ -299,7 +330,7 @@ const styles = `
 `;
 
 /**
- * QR-TCP Demo Custom Element
+ * QR-QUIC Demo Custom Element
  */
 export class QRTCPDemoElement extends HTMLElement {
   private shadow: ShadowRoot;
@@ -381,13 +412,17 @@ export class QRTCPDemoElement extends HTMLElement {
   private handleMeshEvent(event: MeshEvent) {
     switch (event.type) {
       case 'peer_discovered':
-      case 'peer_connected':
-      case 'peer_disconnected':
+      case 'peer_updated':
         this.renderPeerList();
         break;
       case 'packet_sent':
       case 'packet_received':
         this.renderPacketLog();
+        break;
+      case 'packet_acked':
+      case 'packet_failed':
+        this.renderPacketLog();
+        this.renderChatMessages();
         break;
       case 'chat_message':
         this.renderChatMessages();
@@ -406,9 +441,9 @@ export class QRTCPDemoElement extends HTMLElement {
       const data = encodePacket(packet);
       try {
         await QRCode.toCanvas(this.qrCanvas, data, {
-          width: 200,
+          width: 280,
           margin: 2,
-          errorCorrectionLevel: 'M',
+          errorCorrectionLevel: 'L',
         });
         this.mesh.markPacketDisplayed(packet);
       } catch (e) {
@@ -451,7 +486,8 @@ export class QRTCPDemoElement extends HTMLElement {
     const packet = decodePacket(data);
     if (!packet) return;
 
-    if (packet.type === MESSAGE_TYPES.ANNOUNCE && packet.dst === '*') {
+    // Process all packets - QUIC style doesn't distinguish announce vs data at scan level
+    if (packet.mt === MESSAGE_TYPES.ANNOUNCE && packet.dst === '*') {
       this.mesh.processAnnounce(packet);
     } else {
       this.mesh.processPacket(packet);
@@ -479,11 +515,6 @@ export class QRTCPDemoElement extends HTMLElement {
     }
   }
 
-  private connectToPeer(peerId: string) {
-    this.mesh?.connect(peerId);
-    this.selectPeer(peerId);
-  }
-
   private selectPeer(peerId: string) {
     this.selectedPeer = peerId;
     this.renderPeerList();
@@ -507,18 +538,14 @@ export class QRTCPDemoElement extends HTMLElement {
     }
   }
 
-  private getStateClass(state: ConnectionState): string {
-    switch (state) {
-      case ConnectionState.ESTABLISHED:
-        return 'state-connected';
-      case ConnectionState.SYN_SENT:
-      case ConnectionState.SYN_RECEIVED:
-        return 'state-connecting';
-      case ConnectionState.DISCONNECTED:
-        return 'state-disconnected';
-      default:
-        return 'state-error';
-    }
+  private getPeerState(peer: Peer): string {
+    if (peer.sharedKey) return 'active';
+    return 'discovered';
+  }
+
+  private getStateClass(peer: Peer): string {
+    if (peer.sharedKey) return 'state-active';
+    return 'state-discovered';
   }
 
   private renderPeerList() {
@@ -530,23 +557,32 @@ export class QRTCPDemoElement extends HTMLElement {
       return;
     }
 
-    this.peerList.innerHTML = peers.map((peer) => `
-      <div class="peer-item ${this.selectedPeer === peer.id ? 'selected' : ''}" data-peer-id="${peer.id}">
-        <div>
-          <span class="peer-id">${peer.id}</span>
-          ${peer.name ? `<span class="peer-name">"${peer.name}"</span>` : ''}
-          <span class="${this.getStateClass(peer.state)}" style="margin-left: 0.5rem; font-size: 0.875rem;">
-            ${peer.state}
-          </span>
+    this.peerList.innerHTML = peers.map((peer) => {
+      const status = this.mesh!.getDeliveryStatus(peer.id);
+      const state = this.getPeerState(peer);
+
+      return `
+        <div class="peer-item ${this.selectedPeer === peer.id ? 'selected' : ''}" data-peer-id="${peer.id}">
+          <div>
+            <span class="peer-id">${peer.id}</span>
+            ${peer.name ? `<span class="peer-name">"${peer.name}"</span>` : ''}
+            <span class="${this.getStateClass(peer)}" style="margin-left: 0.5rem; font-size: 0.875rem;">
+              ${state}
+            </span>
+            ${status.pending.length > 0 || status.acked.length > 0 ? `
+              <span class="delivery-status">
+                ${status.pending.length > 0 ? `<span class="delivery-dot pending" title="${status.pending.length} pending"></span>` : ''}
+                ${status.acked.length > 0 ? `<span class="delivery-dot acked" title="${status.acked.length} delivered"></span>` : ''}
+                ${status.failed.length > 0 ? `<span class="delivery-dot failed" title="${status.failed.length} failed"></span>` : ''}
+              </span>
+            ` : ''}
+          </div>
+          <div class="peer-actions">
+            <button data-action="chat" data-peer="${peer.id}">Chat</button>
+          </div>
         </div>
-        <div class="peer-actions">
-          ${peer.state === ConnectionState.DISCONNECTED ?
-            `<button class="success" data-action="connect" data-peer="${peer.id}">Connect</button>` : ''}
-          ${peer.state === ConnectionState.ESTABLISHED ?
-            `<button data-action="chat" data-peer="${peer.id}">Chat</button>` : ''}
-        </div>
-      </div>
-    `).join('');
+      `;
+    }).join('');
   }
 
   private renderChatSection() {
@@ -564,19 +600,42 @@ export class QRTCPDemoElement extends HTMLElement {
     if (!this.chatMessages || !this.mesh || !this.selectedPeer) return;
 
     const messages = this.mesh.getChatHistory(this.selectedPeer);
+    const peer = this.mesh.getPeer(this.selectedPeer);
+
     if (messages.length === 0) {
       this.chatMessages.innerHTML = '<p class="text-muted text-center">No messages yet</p>';
       return;
     }
 
-    this.chatMessages.innerHTML = messages.map((msg) => `
-      <div class="chat-message ${msg.direction}">
-        <span class="chat-bubble ${msg.direction}">
-          ${this.escapeHtml(msg.text)}
-          ${msg.encrypted ? '<span class="encrypted-badge">🔒</span>' : ''}
-        </span>
-      </div>
-    `).join('');
+    this.chatMessages.innerHTML = messages.map((msg) => {
+      // Get delivery status for sent messages
+      let statusIcon = '';
+      let bubbleClass: string = msg.direction;
+
+      if (msg.direction === 'sent' && msg.pn !== undefined && peer) {
+        const sent = peer.sentPackets.get(msg.pn);
+        if (sent) {
+          if (sent.status === 'pending') {
+            statusIcon = '<span class="status-icon pending">...</span>';
+            bubbleClass = 'pending';
+          } else if (sent.status === 'acked') {
+            statusIcon = '<span class="status-icon acked">OK</span>';
+          } else if (sent.status === 'failed') {
+            statusIcon = '<span class="status-icon failed">!</span>';
+          }
+        }
+      }
+
+      return `
+        <div class="chat-message ${msg.direction}">
+          <span class="chat-bubble ${bubbleClass}">
+            ${this.escapeHtml(msg.text)}
+            ${msg.encrypted ? '<span class="encrypted-badge">e</span>' : ''}
+            ${statusIcon}
+          </span>
+        </div>
+      `;
+    }).join('');
 
     this.chatMessages.scrollTop = this.chatMessages.scrollHeight;
   }
@@ -592,7 +651,7 @@ export class QRTCPDemoElement extends HTMLElement {
 
     this.packetLog.innerHTML = log.slice(-30).reverse().map((entry) => {
       const time = new Date(entry.timestamp).toLocaleTimeString();
-      const arrow = entry.direction === 'sent' ? '→' : '←';
+      const arrow = entry.direction === 'sent' ? '>' : '<';
       const arrowClass = entry.direction === 'sent' ? 'log-sent' : 'log-received';
       const target = entry.direction === 'sent'
         ? `to ${entry.packet.dst}`
@@ -614,9 +673,10 @@ export class QRTCPDemoElement extends HTMLElement {
   }
 
   private formatPacket(packet: QRPacket): string {
-    const parts = [packet.flags];
-    if (packet.type) parts.push(packet.type);
-    return `${parts.join(' ')} seq=${packet.seq} ack=${packet.ack}`;
+    const parts: string[] = [packet.t];
+    if (packet.mt) parts.push(packet.mt);
+    const acksInfo = packet.acks ? ` acks=${JSON.stringify(packet.acks)}` : '';
+    return `${parts.join(' ')} pn=${packet.pn}${acksInfo}`;
   }
 
   private escapeHtml(text: string): string {
@@ -629,7 +689,7 @@ export class QRTCPDemoElement extends HTMLElement {
     this.shadow.innerHTML = `
       <style>${styles}</style>
       <div class="container">
-        <h1>TCP over QR Code - Mesh Discovery</h1>
+        <h1>QUIC over QR Code - Mesh Chat</h1>
 
         <!-- Device Info -->
         <div class="card">
@@ -650,7 +710,7 @@ export class QRTCPDemoElement extends HTMLElement {
           <div class="card">
             <h2>Outgoing Packet</h2>
             <div class="qr-container">
-              <canvas id="qr-canvas" width="200" height="200"></canvas>
+              <canvas id="qr-canvas" width="280" height="280"></canvas>
             </div>
             <p class="text-xs text-muted text-center" style="margin-top: 0.5rem;">
               Point other device's camera at this QR code
@@ -703,11 +763,11 @@ export class QRTCPDemoElement extends HTMLElement {
         <div class="card">
           <h2>How it works</h2>
           <ul class="info-list">
+            <li>QUIC-inspired protocol: no handshake, 0-RTT encrypted messaging</li>
+            <li>SACK acknowledgments: efficient delivery tracking with ranges</li>
+            <li>Parallel transmission: multiple packets can be in flight</li>
             <li>Each device generates an ECDH keypair for encryption</li>
-            <li>QR codes carry TCP-like packets (SYN, ACK, DATA, FIN)</li>
-            <li>3-way handshake establishes connections with key exchange</li>
-            <li>All chat messages are encrypted with AES-GCM after handshake</li>
-            <li>Stop-and-wait reliability: packets retransmit until ACKed</li>
+            <li>Messages are encrypted with AES-GCM once keys are exchanged</li>
           </ul>
         </div>
       </div>
@@ -744,9 +804,7 @@ export class QRTCPDemoElement extends HTMLElement {
       const action = target.dataset.action;
       const peerId = target.dataset.peer;
 
-      if (action === 'connect' && peerId) {
-        this.connectToPeer(peerId);
-      } else if (action === 'chat' && peerId) {
+      if (action === 'chat' && peerId) {
         this.selectPeer(peerId);
       }
     });

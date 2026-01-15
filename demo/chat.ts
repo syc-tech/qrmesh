@@ -2,14 +2,14 @@
  * QR Mesh Chat Demo
  *
  * A focused chat demo that shows message queueing and transfer via QR codes.
- * Messages are queued up, then transferred when devices scan each other's QR codes.
+ * Uses QUIC-inspired protocol for 0-RTT messaging.
  */
 
 import QRCode from 'qrcode';
 import { getOrCreateKeyPair, type KeyPair, type KeyStorage } from '../crypto';
 import { encodePacket, decodePacket, MESSAGE_TYPES } from '../protocol';
 import { QRScanner } from '../scanner';
-import { MeshState, ConnectionState, type MeshEvent } from '../mesh';
+import { MeshState, type MeshEvent } from '../mesh';
 
 const styles = `
   :host {
@@ -229,16 +229,16 @@ const styles = `
     border-radius: 50%;
   }
 
-  .peer-badge .dot.connected {
+  .peer-badge .dot.active {
     background: #10b981;
   }
 
-  .peer-badge .dot.disconnected {
-    background: #64748b;
+  .peer-badge .dot.discovered {
+    background: #f59e0b;
   }
 
-  .peer-badge .dot.connecting {
-    background: #f59e0b;
+  .peer-badge .dot.inactive {
+    background: #64748b;
   }
 
   .chat-section {
@@ -266,6 +266,22 @@ const styles = `
     font-size: 0.75rem;
     padding: 0.125rem 0.5rem;
     border-radius: 9999px;
+  }
+
+  .delivery-badge {
+    font-size: 0.75rem;
+    padding: 0.125rem 0.5rem;
+    border-radius: 9999px;
+  }
+
+  .delivery-badge.pending {
+    background: #f59e0b;
+    color: black;
+  }
+
+  .delivery-badge.acked {
+    background: #10b981;
+    color: white;
   }
 
   .chat-messages {
@@ -354,8 +370,9 @@ const styles = `
   }
 
   .message-status.queued { color: #f59e0b; }
-  .message-status.sent { color: #3b82f6; }
-  .message-status.delivered { color: #10b981; }
+  .message-status.pending { color: #f59e0b; }
+  .message-status.acked { color: #10b981; }
+  .message-status.failed { color: #ef4444; }
 
   .chat-input-area {
     padding: 1rem;
@@ -416,7 +433,8 @@ interface QueuedMessage {
   id: string;
   text: string;
   timestamp: number;
-  status: 'queued' | 'sending' | 'sent' | 'delivered';
+  pn?: number;  // Packet number once sent
+  status: 'queued' | 'pending' | 'acked' | 'failed';
 }
 
 export class QRMeshChatElement extends HTMLElement {
@@ -426,9 +444,9 @@ export class QRMeshChatElement extends HTMLElement {
   private scanner: QRScanner | null = null;
   private qrInterval: ReturnType<typeof setInterval> | null = null;
   private retryInterval: ReturnType<typeof setInterval> | null = null;
-  private connectedPeerId: string | null = null;
+  private activePeerId: string | null = null;
   private messageQueue: QueuedMessage[] = [];
-  private sentMessages: Array<{ text: string; timestamp: number; status: string }> = [];
+  private sentMessages: Array<{ text: string; timestamp: number; pn?: number }> = [];
   private receivedMessages: Array<{ text: string; timestamp: number }> = [];
 
   // DOM refs
@@ -440,6 +458,7 @@ export class QRMeshChatElement extends HTMLElement {
   private chatMessages: HTMLElement | null = null;
   private chatInput: HTMLInputElement | null = null;
   private queueBadge: HTMLElement | null = null;
+  private deliveryBadge: HTMLElement | null = null;
   private statusDot: HTMLElement | null = null;
   private statusText: HTMLElement | null = null;
 
@@ -479,6 +498,7 @@ export class QRMeshChatElement extends HTMLElement {
       this.retryInterval = setInterval(() => {
         this.mesh?.checkRetries();
         this.processMessageQueue();
+        this.updateDeliveryStatus();
       }, 1000);
 
       this.updateStatus('Ready', 'idle');
@@ -493,16 +513,36 @@ export class QRMeshChatElement extends HTMLElement {
       case 'peer_discovered':
         this.updatePeerBadge(event.peer.id, 'discovered');
         break;
-      case 'peer_connected':
-        this.connectedPeerId = event.peer.id;
-        this.updatePeerBadge(event.peer.id, 'connected');
-        this.updateStatus('Connected', 'connected');
-        this.processMessageQueue();
+      case 'peer_updated':
+        if (event.peer.sharedKey) {
+          this.activePeerId = event.peer.id;
+          this.updatePeerBadge(event.peer.id, 'active');
+          this.updateStatus('Connected (0-RTT)', 'connected');
+          this.processMessageQueue();
+        }
         break;
-      case 'peer_disconnected':
-        this.connectedPeerId = null;
-        this.updatePeerBadge(null, 'disconnected');
-        this.updateStatus('Disconnected', 'idle');
+      case 'packet_acked':
+        // Update message status
+        const ackedMsg = this.messageQueue.find(m => m.pn === event.pn);
+        if (ackedMsg) {
+          ackedMsg.status = 'acked';
+          this.sentMessages.push({
+            text: ackedMsg.text,
+            timestamp: ackedMsg.timestamp,
+            pn: ackedMsg.pn,
+          });
+          this.messageQueue = this.messageQueue.filter(m => m.id !== ackedMsg.id);
+          this.updateQueueBadge();
+          this.renderMessages();
+        }
+        this.updateDeliveryStatus();
+        break;
+      case 'packet_failed':
+        const failedMsg = this.messageQueue.find(m => m.pn === event.pn);
+        if (failedMsg) {
+          failedMsg.status = 'failed';
+          this.renderMessages();
+        }
         break;
       case 'chat_message':
         if (event.message.direction === 'received') {
@@ -511,35 +551,23 @@ export class QRMeshChatElement extends HTMLElement {
             timestamp: event.message.timestamp,
           });
           this.renderMessages();
-        } else {
-          // Update sent message status
-          const queued = this.messageQueue.find(m => m.text === event.message.text);
-          if (queued) {
-            queued.status = 'sent';
-            this.sentMessages.push({
-              text: queued.text,
-              timestamp: queued.timestamp,
-              status: 'delivered',
-            });
-            this.messageQueue = this.messageQueue.filter(m => m.id !== queued.id);
-            this.updateQueueBadge();
-            this.renderMessages();
-          }
         }
         break;
     }
   }
 
   private async processMessageQueue() {
-    if (!this.mesh || !this.connectedPeerId) return;
+    if (!this.mesh || !this.activePeerId) return;
 
-    const peer = this.mesh.getPeer(this.connectedPeerId);
-    if (!peer || peer.state !== ConnectionState.ESTABLISHED) return;
+    const peer = this.mesh.getPeer(this.activePeerId);
+    if (!peer) return;
 
     for (const msg of this.messageQueue) {
       if (msg.status === 'queued') {
-        msg.status = 'sending';
-        await this.mesh.sendChat(this.connectedPeerId, msg.text);
+        msg.status = 'pending';
+        const pn = await this.mesh.sendChat(this.activePeerId, msg.text);
+        msg.pn = pn;
+        this.renderMessages();
       }
     }
   }
@@ -591,14 +619,13 @@ export class QRMeshChatElement extends HTMLElement {
     const packet = decodePacket(data);
     if (!packet) return;
 
-    if (packet.type === MESSAGE_TYPES.ANNOUNCE && packet.dst === '*') {
+    if (packet.mt === MESSAGE_TYPES.ANNOUNCE && packet.dst === '*') {
       this.mesh.processAnnounce(packet);
-      // Auto-connect when we discover a peer
+      // Auto-select peer when discovered
       const peers = this.mesh.getPeers();
-      const disconnected = peers.find(p => p.state === ConnectionState.DISCONNECTED);
-      if (disconnected) {
-        this.mesh.connect(disconnected.id);
-        this.updateStatus('Connecting...', 'connecting');
+      if (peers.length > 0 && !this.activePeerId) {
+        this.activePeerId = peers[0].id;
+        this.updatePeerBadge(peers[0].id, peers[0].sharedKey ? 'active' : 'discovered');
       }
     } else {
       this.mesh.processPacket(packet);
@@ -616,8 +643,8 @@ export class QRMeshChatElement extends HTMLElement {
     this.updateQueueBadge();
     this.renderMessages();
 
-    // If connected, start sending immediately
-    if (this.connectedPeerId) {
+    // If we have an active peer, start sending immediately
+    if (this.activePeerId) {
       this.processMessageQueue();
     }
   }
@@ -634,7 +661,7 @@ export class QRMeshChatElement extends HTMLElement {
     }
   }
 
-  private updatePeerBadge(peerId: string | null, state: 'discovered' | 'connected' | 'disconnected') {
+  private updatePeerBadge(peerId: string | null, state: 'discovered' | 'active' | 'inactive') {
     if (!this.peerBadge) return;
 
     if (!peerId) {
@@ -647,7 +674,7 @@ export class QRMeshChatElement extends HTMLElement {
     const idSpan = this.peerBadge.querySelector('.peer-id');
 
     if (dot) {
-      dot.className = 'dot ' + (state === 'connected' ? 'connected' : state === 'discovered' ? 'connecting' : 'disconnected');
+      dot.className = 'dot ' + state;
     }
     if (idSpan) {
       idSpan.textContent = peerId;
@@ -656,12 +683,29 @@ export class QRMeshChatElement extends HTMLElement {
 
   private updateQueueBadge() {
     if (!this.queueBadge) return;
-    const count = this.messageQueue.filter(m => m.status === 'queued').length;
+    const count = this.messageQueue.filter(m => m.status === 'queued' || m.status === 'pending').length;
     if (count > 0) {
-      this.queueBadge.textContent = `${count} queued`;
+      this.queueBadge.textContent = `${count} pending`;
       this.queueBadge.classList.remove('hidden');
     } else {
       this.queueBadge.classList.add('hidden');
+    }
+  }
+
+  private updateDeliveryStatus() {
+    if (!this.deliveryBadge || !this.mesh || !this.activePeerId) return;
+
+    const status = this.mesh.getDeliveryStatus(this.activePeerId);
+    if (status.pending.length > 0) {
+      this.deliveryBadge.textContent = `${status.pending.length} in flight`;
+      this.deliveryBadge.className = 'delivery-badge pending';
+      this.deliveryBadge.classList.remove('hidden');
+    } else if (status.acked.length > 0) {
+      this.deliveryBadge.textContent = `${status.acked.length} delivered`;
+      this.deliveryBadge.className = 'delivery-badge acked';
+      this.deliveryBadge.classList.remove('hidden');
+    } else {
+      this.deliveryBadge.classList.add('hidden');
     }
   }
 
@@ -683,16 +727,32 @@ export class QRMeshChatElement extends HTMLElement {
   private renderMessages() {
     if (!this.chatMessages) return;
 
+    // Get delivery status for sent messages
+    const peerStatus = this.mesh && this.activePeerId
+      ? this.mesh.getDeliveryStatus(this.activePeerId)
+      : { pending: [], acked: [], failed: [] };
+
     // Combine all messages and sort by timestamp
     const allMessages: Array<{
       text: string;
       timestamp: number;
       type: 'sent' | 'received' | 'queued';
       status?: string;
+      pn?: number;
     }> = [
-      ...this.sentMessages.map(m => ({ ...m, type: 'sent' as const })),
+      ...this.sentMessages.map(m => ({
+        ...m,
+        type: 'sent' as const,
+        status: m.pn && peerStatus.acked.includes(m.pn) ? 'acked' : 'sent',
+      })),
       ...this.receivedMessages.map(m => ({ ...m, type: 'received' as const })),
-      ...this.messageQueue.map(m => ({ text: m.text, timestamp: m.timestamp, type: 'queued' as const, status: m.status })),
+      ...this.messageQueue.map(m => ({
+        text: m.text,
+        timestamp: m.timestamp,
+        type: 'queued' as const,
+        status: m.status,
+        pn: m.pn,
+      })),
     ].sort((a, b) => a.timestamp - b.timestamp);
 
     if (allMessages.length === 0) {
@@ -700,7 +760,7 @@ export class QRMeshChatElement extends HTMLElement {
         <div class="chat-empty">
           <div>
             <p>No messages yet</p>
-            <p style="font-size: 0.75rem; margin-top: 0.25rem;">Type a message below to queue it for sending</p>
+            <p style="font-size: 0.75rem; margin-top: 0.25rem;">Type a message below - it sends immediately (0-RTT)</p>
           </div>
         </div>
       `;
@@ -709,10 +769,21 @@ export class QRMeshChatElement extends HTMLElement {
 
     this.chatMessages.innerHTML = allMessages.map(msg => {
       const time = new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      const statusIcon = msg.type === 'queued' ? '⏳' : msg.type === 'sent' ? '✓' : '';
+      let statusIcon = '';
+
+      if (msg.type === 'queued') {
+        if (msg.status === 'queued') statusIcon = '...';
+        else if (msg.status === 'pending') statusIcon = '...';
+        else if (msg.status === 'acked') statusIcon = 'OK';
+        else if (msg.status === 'failed') statusIcon = '!';
+      } else if (msg.type === 'sent') {
+        statusIcon = 'OK';
+      }
+
+      const msgClass = msg.type === 'queued' ? (msg.status === 'pending' ? 'sent' : 'queued') : msg.type;
 
       return `
-        <div class="message ${msg.type}">
+        <div class="message ${msgClass}">
           <div class="message-bubble">${this.escapeHtml(msg.text)}</div>
           <div class="message-meta">
             <span>${time}</span>
@@ -736,13 +807,13 @@ export class QRMeshChatElement extends HTMLElement {
       <style>${styles}</style>
       <div class="container">
         <h1>QR Mesh Chat</h1>
-        <p class="subtitle">Queue messages, then point cameras at each other to transfer</p>
+        <p class="subtitle">QUIC-style 0-RTT messaging over QR codes</p>
 
         <div class="device-info">
           <span style="color: #64748b;">Your ID:</span>
           <span class="device-id" id="device-id">...</span>
           <div class="peer-badge hidden" id="peer-badge">
-            <span class="dot disconnected"></span>
+            <span class="dot inactive"></span>
             <span class="peer-id"></span>
           </div>
         </div>
@@ -778,30 +849,33 @@ export class QRMeshChatElement extends HTMLElement {
         <div class="chat-section">
           <div class="chat-header">
             <h2>Messages</h2>
-            <span class="message-queue-badge hidden" id="queue-badge">0 queued</span>
+            <div style="display: flex; gap: 0.5rem;">
+              <span class="delivery-badge hidden" id="delivery-badge"></span>
+              <span class="message-queue-badge hidden" id="queue-badge">0 pending</span>
+            </div>
           </div>
           <div class="chat-messages" id="chat-messages">
             <div class="chat-empty">
               <div>
                 <p>No messages yet</p>
-                <p style="font-size: 0.75rem; margin-top: 0.25rem;">Type a message below to queue it for sending</p>
+                <p style="font-size: 0.75rem; margin-top: 0.25rem;">Type a message below - it sends immediately (0-RTT)</p>
               </div>
             </div>
           </div>
           <div class="chat-input-area">
             <input type="text" id="chat-input" placeholder="Type a message..." />
-            <button id="send-btn">Queue</button>
+            <button id="send-btn">Send</button>
           </div>
         </div>
 
         <div class="instructions">
-          <h3>How to use:</h3>
+          <h3>How it works:</h3>
           <ol>
             <li>Open this page on two devices</li>
-            <li>Type messages and click "Queue" to prepare them</li>
             <li>Click "Start Camera" on both devices</li>
-            <li>Point the cameras at each other's QR codes</li>
-            <li>Messages will transfer automatically once connected!</li>
+            <li>Point cameras at each other's QR codes</li>
+            <li>Start chatting - messages send immediately with 0-RTT!</li>
+            <li>Watch the delivery status update as packets are acknowledged</li>
           </ol>
         </div>
       </div>
@@ -816,6 +890,7 @@ export class QRMeshChatElement extends HTMLElement {
     this.chatMessages = this.shadow.getElementById('chat-messages');
     this.chatInput = this.shadow.getElementById('chat-input') as HTMLInputElement;
     this.queueBadge = this.shadow.getElementById('queue-badge');
+    this.deliveryBadge = this.shadow.getElementById('delivery-badge');
     this.statusDot = this.shadow.getElementById('status-dot');
     this.statusText = this.shadow.getElementById('status-text');
 

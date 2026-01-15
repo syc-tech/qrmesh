@@ -1,82 +1,94 @@
 /**
- * QR-TCP Protocol - Packet encoding, decoding, and CRC
+ * QR-QUIC Protocol - QUIC-inspired packet format for QR transmission
  *
- * This module defines the packet structure and provides utilities
- * for creating, encoding, and decoding protocol packets.
+ * Key differences from TCP-style:
+ * - No connection handshake (0-RTT with cached keys)
+ * - Packet numbers instead of sequence numbers (monotonic, never reused)
+ * - SACK-style ACK ranges for efficient acknowledgment
+ * - Connectionless feel - each packet is self-contained
  */
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 export const BROADCAST_ADDR = '*';
 
-// Packet flags
-export const FLAGS = {
-  SYN: 'SYN',
-  ACK: 'ACK',
-  FIN: 'FIN',
-  DATA: 'DATA',
-  SYNACK: 'SYN|ACK',
+// Packet types (replacing TCP-style flags)
+export const PACKET_TYPES = {
+  INITIAL: 'I',   // First contact - includes public key
+  DATA: 'D',      // Regular data packet
+  ACK: 'A',       // Pure acknowledgment
 } as const;
 
 // Message types for DATA packets
 export const MESSAGE_TYPES = {
-  ANNOUNCE: 'ANNOUNCE',
-  DISCOVER: 'DISCOVER',
-  OFFER: 'OFFER',
-  ROUTE: 'ROUTE',
-  CHAT: 'CHAT',
+  ANNOUNCE: 'ANN',
+  CHAT: 'CHT',
+  OFFER: 'OFR',
+  ROUTE: 'RTE',
 } as const;
 
-export type Flag = (typeof FLAGS)[keyof typeof FLAGS];
+export type PacketType = (typeof PACKET_TYPES)[keyof typeof PACKET_TYPES];
 export type MessageType = (typeof MESSAGE_TYPES)[keyof typeof MESSAGE_TYPES];
 
+// ACK range: [start, end] inclusive
+// e.g., [[1,5], [7,9]] means "received packets 1-5 and 7-9, missing 6"
+export type AckRange = [number, number];
+
 /**
- * Core packet structure
+ * Core packet structure (QUIC-style)
  */
 export interface QRPacket {
-  v: number; // Protocol version
-  src: string; // Source device ID (8 chars)
-  dst: string; // Destination ID or '*' for broadcast
-  seq: number; // Sequence number
-  ack: number; // Acknowledgment number
-  flags: string; // SYN|ACK|FIN|DATA
-  type?: MessageType; // Message type for DATA packets
-  payload?: unknown; // Message payload
-  crc: string; // CRC16 checksum
+  v: number;          // Protocol version
+  src: string;        // Source device ID (8 chars)
+  dst: string;        // Destination ID or '*' for broadcast
+  pn: number;         // Packet number (monotonic, never reused)
+  t: PacketType;      // Packet type
+  acks?: AckRange[];  // SACK ranges of received packet numbers
+  mt?: MessageType;   // Message type (for DATA packets)
+  p?: unknown;        // Payload
+  crc: string;        // CRC16 checksum
+}
+
+/**
+ * Payload for INITIAL packets (key exchange)
+ */
+export interface InitialPayload {
+  key: string;        // Base64 encoded public key
+  name?: string;      // Optional device name
 }
 
 /**
  * Payload for ANNOUNCE messages
  */
 export interface AnnouncePayload {
-  publicKey: string; // Base64 encoded public key
-  name?: string; // Optional device name
+  key: string;        // Base64 encoded public key
+  name?: string;      // Optional device name
 }
 
 /**
  * Payload for OFFER messages (connection upgrade)
  */
 export interface OfferPayload {
-  wsUrl?: string; // WebSocket URL
+  wsUrl?: string;     // WebSocket URL
   webrtcSdp?: string; // WebRTC SDP offer
-  ipPort?: string; // IP:port for direct connection
+  ipPort?: string;    // IP:port for direct connection
 }
 
 /**
  * Payload for ROUTE messages (mesh routing)
  */
 export interface RoutePayload {
-  reachable: string[]; // List of device IDs this node can reach
-  hops: Record<string, number>; // Device ID -> hop count
+  reachable: string[];              // List of device IDs this node can reach
+  hops: Record<string, number>;     // Device ID -> hop count
 }
 
 /**
  * Payload for CHAT messages
  */
 export interface ChatPayload {
-  encrypted?: boolean;
-  ciphertext?: string;
-  iv?: string;
-  plaintext?: string; // Only for unencrypted messages
+  enc?: boolean;      // Encrypted?
+  ct?: string;        // Ciphertext
+  iv?: string;        // IV
+  pt?: string;        // Plaintext (only for unencrypted)
 }
 
 /**
@@ -106,14 +118,14 @@ export function createPacket(params: Omit<QRPacket, 'v' | 'crc'>): QRPacket {
     v: PROTOCOL_VERSION,
     src: params.src,
     dst: params.dst,
-    seq: params.seq,
-    ack: params.ack,
-    flags: params.flags,
+    pn: params.pn,
+    t: params.t,
     crc: '',
   };
 
-  if (params.type) packet.type = params.type;
-  if (params.payload !== undefined) packet.payload = params.payload;
+  if (params.acks && params.acks.length > 0) packet.acks = params.acks;
+  if (params.mt) packet.mt = params.mt;
+  if (params.p !== undefined) packet.p = params.p;
 
   // Calculate CRC over all fields except crc itself
   const crcData = JSON.stringify({ ...packet, crc: undefined });
@@ -160,118 +172,188 @@ export function decodePacket(data: string): QRPacket | null {
 }
 
 /**
- * Check if packet has specific flag
- */
-export function hasFlag(packet: QRPacket, flag: string): boolean {
-  return packet.flags.includes(flag);
-}
-
-/**
  * Check if packet is for us (or broadcast)
  */
 export function isForUs(packet: QRPacket, ourId: string): boolean {
   return packet.dst === ourId || packet.dst === BROADCAST_ADDR;
 }
 
+// SACK utilities
+
+/**
+ * Add a packet number to ACK ranges, merging adjacent ranges
+ */
+export function addToAckRanges(ranges: AckRange[], pn: number): AckRange[] {
+  if (ranges.length === 0) {
+    return [[pn, pn]];
+  }
+
+  const newRanges: AckRange[] = [];
+  let inserted = false;
+
+  for (const [start, end] of ranges) {
+    if (inserted) {
+      // Check if we can merge with previous
+      const prev = newRanges[newRanges.length - 1];
+      if (prev && start <= prev[1] + 1) {
+        prev[1] = Math.max(prev[1], end);
+      } else {
+        newRanges.push([start, end]);
+      }
+    } else if (pn < start - 1) {
+      // Insert before this range
+      newRanges.push([pn, pn]);
+      newRanges.push([start, end]);
+      inserted = true;
+    } else if (pn <= end + 1) {
+      // Merge with this range
+      newRanges.push([Math.min(start, pn), Math.max(end, pn)]);
+      inserted = true;
+    } else {
+      newRanges.push([start, end]);
+    }
+  }
+
+  if (!inserted) {
+    newRanges.push([pn, pn]);
+  }
+
+  // Merge any adjacent ranges that resulted from insertion
+  const merged: AckRange[] = [];
+  for (const range of newRanges) {
+    const prev = merged[merged.length - 1];
+    if (prev && range[0] <= prev[1] + 1) {
+      prev[1] = Math.max(prev[1], range[1]);
+    } else {
+      merged.push(range);
+    }
+  }
+
+  return merged;
+}
+
+/**
+ * Check if a packet number is acknowledged by the ranges
+ */
+export function isAcked(ranges: AckRange[], pn: number): boolean {
+  for (const [start, end] of ranges) {
+    if (pn >= start && pn <= end) return true;
+    if (pn < start) return false; // Ranges are sorted
+  }
+  return false;
+}
+
+/**
+ * Get missing packet numbers from ranges (up to highest received)
+ */
+export function getMissing(ranges: AckRange[], _maxPn?: number): number[] {
+  if (ranges.length === 0) return [];
+
+  const missing: number[] = [];
+
+  let expected = ranges[0][0];
+  for (const [start, end] of ranges) {
+    for (let i = expected; i < start; i++) {
+      missing.push(i);
+    }
+    expected = end + 1;
+  }
+
+  return missing;
+}
+
+/**
+ * Get the highest acknowledged packet number
+ */
+export function getHighestAcked(ranges: AckRange[]): number {
+  if (ranges.length === 0) return -1;
+  return ranges[ranges.length - 1][1];
+}
+
 // Packet factory functions
 
-export function createSynPacket(
+export function createInitialPacket(
   src: string,
   dst: string,
-  seq: number,
-  payload?: AnnouncePayload
+  pn: number,
+  publicKey: string,
+  name?: string,
+  acks?: AckRange[]
 ): QRPacket {
   return createPacket({
     src,
     dst,
-    seq,
-    ack: 0,
-    flags: FLAGS.SYN,
-    type: MESSAGE_TYPES.ANNOUNCE,
-    payload,
-  });
-}
-
-export function createSynAckPacket(
-  src: string,
-  dst: string,
-  seq: number,
-  ack: number,
-  payload?: AnnouncePayload
-): QRPacket {
-  return createPacket({
-    src,
-    dst,
-    seq,
-    ack,
-    flags: FLAGS.SYNACK,
-    type: MESSAGE_TYPES.ANNOUNCE,
-    payload,
-  });
-}
-
-export function createAckPacket(
-  src: string,
-  dst: string,
-  seq: number,
-  ack: number
-): QRPacket {
-  return createPacket({
-    src,
-    dst,
-    seq,
-    ack,
-    flags: FLAGS.ACK,
+    pn,
+    t: PACKET_TYPES.INITIAL,
+    acks,
+    p: { key: publicKey, name } as InitialPayload,
   });
 }
 
 export function createDataPacket(
   src: string,
   dst: string,
-  seq: number,
-  ack: number,
-  type: MessageType,
-  payload: unknown
+  pn: number,
+  messageType: MessageType,
+  payload: unknown,
+  acks?: AckRange[]
 ): QRPacket {
   return createPacket({
     src,
     dst,
-    seq,
-    ack,
-    flags: FLAGS.DATA,
-    type,
-    payload,
+    pn,
+    t: PACKET_TYPES.DATA,
+    mt: messageType,
+    p: payload,
+    acks,
+  });
+}
+
+export function createAckPacket(
+  src: string,
+  dst: string,
+  pn: number,
+  acks: AckRange[]
+): QRPacket {
+  return createPacket({
+    src,
+    dst,
+    pn,
+    t: PACKET_TYPES.ACK,
+    acks,
   });
 }
 
 export function createAnnouncePacket(
   src: string,
-  seq: number,
+  pn: number,
   publicKey: string,
   name?: string
 ): QRPacket {
   return createPacket({
     src,
     dst: BROADCAST_ADDR,
-    seq,
-    ack: 0,
-    flags: FLAGS.DATA,
-    type: MESSAGE_TYPES.ANNOUNCE,
-    payload: { publicKey, name } as AnnouncePayload,
+    pn,
+    t: PACKET_TYPES.DATA,
+    mt: MESSAGE_TYPES.ANNOUNCE,
+    p: { key: publicKey, name } as AnnouncePayload,
   });
 }
 
-export function createFinPacket(
+export function createChatPacket(
   src: string,
   dst: string,
-  seq: number,
-  ack: number
+  pn: number,
+  payload: ChatPayload,
+  acks?: AckRange[]
 ): QRPacket {
   return createPacket({
     src,
     dst,
-    seq,
-    ack,
-    flags: FLAGS.FIN,
+    pn,
+    t: PACKET_TYPES.DATA,
+    mt: MESSAGE_TYPES.CHAT,
+    p: payload,
+    acks,
   });
 }

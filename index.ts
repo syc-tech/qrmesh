@@ -1,12 +1,17 @@
 /**
- * QR-TCP Library
+ * QR-QUIC Library
  *
- * A TCP-like protocol for peer-to-peer communication over QR codes.
+ * A QUIC-inspired protocol for peer-to-peer communication over QR codes.
  * Supports mesh discovery, encrypted messaging, and connection upgrades.
+ *
+ * Key features:
+ * - 0-RTT: No handshake needed, send encrypted data immediately
+ * - SACK: Selective acknowledgments for efficient delivery tracking
+ * - Parallel transmission: Multiple packets in flight simultaneously
  *
  * @example
  * ```typescript
- * import { getOrCreateKeyPair, MeshState, QRScanner, encodePacket, decodePacket } from '@/lib/qrtcp';
+ * import { getOrCreateKeyPair, MeshState, QRScanner, encodePacket, decodePacket } from '@/lib/qrmesh';
  *
  * // Create identity
  * const keyPair = await getOrCreateKeyPair(localStorage);
@@ -53,11 +58,13 @@ export {
 export {
   PROTOCOL_VERSION,
   BROADCAST_ADDR,
-  FLAGS,
+  PACKET_TYPES,
   MESSAGE_TYPES,
-  type Flag,
+  type PacketType,
   type MessageType,
+  type AckRange,
   type QRPacket,
+  type InitialPayload,
   type AnnouncePayload,
   type OfferPayload,
   type RoutePayload,
@@ -65,14 +72,16 @@ export {
   createPacket,
   encodePacket,
   decodePacket,
-  hasFlag,
   isForUs,
-  createSynPacket,
-  createSynAckPacket,
-  createAckPacket,
+  addToAckRanges,
+  isAcked,
+  getMissing,
+  getHighestAcked,
+  createInitialPacket,
   createDataPacket,
+  createAckPacket,
   createAnnouncePacket,
-  createFinPacket,
+  createChatPacket,
 } from './protocol';
 
 // Scanner exports
@@ -87,7 +96,7 @@ export {
 
 // Mesh exports
 export {
-  ConnectionState,
+  type SentPacket,
   type Peer,
   type PacketLogEntry,
   type ChatMessage,

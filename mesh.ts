@@ -1,52 +1,57 @@
 /**
- * Mesh State - Connection state machine and peer management
+ * Mesh State - QUIC-style peer management and packet handling
  *
- * This module manages the TCP-like connection state machine,
- * peer tracking, and message handling for the QR-TCP protocol.
+ * Key differences from TCP-style:
+ * - No connection state machine (no handshake)
+ * - SACK-style acknowledgments with ranges
+ * - Parallel packet transmission (don't wait for ACKs)
+ * - 0-RTT: Send encrypted data immediately if we have peer's key
  */
 
 import { KeyPair, deriveSharedKey, encrypt, decrypt } from './crypto';
 import {
   QRPacket,
-  createSynPacket,
-  createSynAckPacket,
-  createAckPacket,
+  AckRange,
+  createInitialPacket,
   createDataPacket,
+  createAckPacket,
   createAnnouncePacket,
-  createFinPacket,
-  hasFlag,
+  createChatPacket,
   isForUs,
+  addToAckRanges,
+  PACKET_TYPES,
   MESSAGE_TYPES,
+  InitialPayload,
   AnnouncePayload,
   ChatPayload,
   OfferPayload,
 } from './protocol';
 
 /**
- * Connection states (TCP-like)
+ * Sent packet tracking for delivery status
  */
-export enum ConnectionState {
-  DISCONNECTED = 'DISCONNECTED',
-  SYN_SENT = 'SYN_SENT',
-  SYN_RECEIVED = 'SYN_RECEIVED',
-  ESTABLISHED = 'ESTABLISHED',
-  FIN_WAIT = 'FIN_WAIT',
-  CLOSED = 'CLOSED',
+export interface SentPacket {
+  packet: QRPacket;
+  timestamp: number;
+  retries: number;
+  status: 'pending' | 'acked' | 'failed';
 }
 
 /**
- * Peer information
+ * Peer information (simplified from TCP-style)
  */
 export interface Peer {
   id: string;
   publicKey: string;
   name?: string;
-  state: ConnectionState;
+  sharedKey?: CryptoKey;      // Derived shared key for encryption
   lastSeen: number;
-  sendSeq: number;
-  recvSeq: number;
-  sharedKey?: CryptoKey;
-  pendingPackets: QRPacket[];
+  // SACK tracking
+  receivedPns: AckRange[];    // Packet numbers we've received from this peer
+  ackedByPeer: AckRange[];    // What this peer has acked from us
+  // Outgoing
+  nextPn: number;             // Next packet number to use when sending
+  sentPackets: Map<number, SentPacket>; // pn -> sent packet info
   offer?: OfferPayload;
 }
 
@@ -69,6 +74,7 @@ export interface ChatMessage {
   text: string;
   timestamp: number;
   encrypted: boolean;
+  pn?: number;  // Packet number for tracking delivery
 }
 
 /**
@@ -76,10 +82,11 @@ export interface ChatMessage {
  */
 export type MeshEvent =
   | { type: 'peer_discovered'; peer: Peer }
-  | { type: 'peer_connected'; peer: Peer }
-  | { type: 'peer_disconnected'; peer: Peer }
+  | { type: 'peer_updated'; peer: Peer }
   | { type: 'packet_sent'; packet: QRPacket }
   | { type: 'packet_received'; packet: QRPacket }
+  | { type: 'packet_acked'; pn: number; peerId: string }
+  | { type: 'packet_failed'; pn: number; peerId: string }
   | { type: 'chat_message'; message: ChatMessage }
   | { type: 'offer_received'; peerId: string; offer: OfferPayload }
   | { type: 'error'; message: string };
@@ -91,16 +98,13 @@ export type MeshEventHandler = (event: MeshEvent) => void;
  */
 export interface MeshConfig {
   deviceName?: string;
-  retryTimeout?: number; // ms before retrying unacked packet
-  maxRetries?: number; // max retry attempts
-  maxLogSize?: number; // max packet log entries
+  retryTimeout?: number;  // ms before retrying unacked packet
+  maxRetries?: number;    // max retry attempts
+  maxLogSize?: number;    // max packet log entries
 }
 
 /**
- * Mesh state manager
- *
- * Manages peer connections, packet handling, and the TCP-like
- * state machine for each connection.
+ * Mesh state manager (QUIC-style)
  */
 export class MeshState {
   private keyPair: KeyPair;
@@ -108,8 +112,8 @@ export class MeshState {
   private packetLog: PacketLogEntry[] = [];
   private chatHistory: ChatMessage[] = [];
   private eventHandlers: Set<MeshEventHandler> = new Set();
-  private outgoingQueue: QRPacket[] = [];
-  private announceSeq: number = 0;
+  private globalPn: number = 0;  // Global packet number counter
+  private cachedAnnounce: QRPacket | null = null;
   private deviceName?: string;
   private retryTimeout: number;
   private maxRetries: number;
@@ -164,10 +168,10 @@ export class MeshState {
   }
 
   /**
-   * Get connected peers only
+   * Get peers we can communicate with (have shared key)
    */
-  getConnectedPeers(): Peer[] {
-    return this.getPeers().filter((p) => p.state === ConnectionState.ESTABLISHED);
+  getActivePeers(): Peer[] {
+    return this.getPeers().filter((p) => p.sharedKey !== undefined);
   }
 
   /**
@@ -188,94 +192,151 @@ export class MeshState {
   }
 
   /**
-   * Get next packet to display as QR code
-   *
-   * Priority: pending packets needing ACK > queued packets > announce
+   * Get delivery status for all pending packets to a peer
    */
-  getNextOutgoingPacket(): QRPacket | null {
-    // Priority 1: pending packets with retries
+  getDeliveryStatus(peerId: string): { pending: number[]; acked: number[]; failed: number[] } {
+    const peer = this.peers.get(peerId);
+    if (!peer) return { pending: [], acked: [], failed: [] };
+
+    const pending: number[] = [];
+    const acked: number[] = [];
+    const failed: number[] = [];
+
+    for (const [pn, sent] of peer.sentPackets) {
+      if (sent.status === 'pending') pending.push(pn);
+      else if (sent.status === 'acked') acked.push(pn);
+      else if (sent.status === 'failed') failed.push(pn);
+    }
+
+    return { pending, acked, failed };
+  }
+
+  /**
+   * Get next packet number (monotonically increasing)
+   */
+  private getNextPn(): number {
+    return this.globalPn++;
+  }
+
+  /**
+   * Get packets to display as QR codes
+   *
+   * Returns multiple packets that can be shown in sequence
+   * Priority: packets needing retransmission > new data > announce
+   */
+  getOutgoingPackets(maxPackets: number = 3): QRPacket[] {
+    const packets: QRPacket[] = [];
+    const now = Date.now();
+
+    // Priority 1: Packets needing retransmission
     for (const peer of this.peers.values()) {
-      if (peer.pendingPackets.length > 0) {
-        return peer.pendingPackets[0];
+      for (const [, sent] of peer.sentPackets) {
+        if (sent.status === 'pending' && now - sent.timestamp > this.retryTimeout) {
+          if (sent.retries < this.maxRetries) {
+            packets.push(sent.packet);
+            if (packets.length >= maxPackets) return packets;
+          }
+        }
       }
     }
 
-    // Priority 2: queued outgoing packets
-    if (this.outgoingQueue.length > 0) {
-      return this.outgoingQueue[0];
+    // Priority 2: Fresh pending packets (not yet due for retry)
+    for (const peer of this.peers.values()) {
+      for (const [, sent] of peer.sentPackets) {
+        if (sent.status === 'pending' && now - sent.timestamp <= this.retryTimeout) {
+          packets.push(sent.packet);
+          if (packets.length >= maxPackets) return packets;
+        }
+      }
     }
 
     // Default: broadcast announce
-    return this.createAnnounce();
+    if (packets.length === 0) {
+      packets.push(this.createAnnounce());
+    }
+
+    return packets;
   }
 
   /**
-   * Create an announce packet
+   * Get next single packet (for compatibility)
+   */
+  getNextOutgoingPacket(): QRPacket | null {
+    const packets = this.getOutgoingPackets(1);
+    return packets[0] || null;
+  }
+
+  /**
+   * Create an announce packet (cached to avoid QR flickering)
    */
   createAnnounce(): QRPacket {
-    return createAnnouncePacket(
-      this.deviceId,
-      this.announceSeq++,
-      this.publicKey,
-      this.deviceName
-    );
+    if (!this.cachedAnnounce) {
+      this.cachedAnnounce = createAnnouncePacket(
+        this.deviceId,
+        this.getNextPn(),
+        this.publicKey,
+        this.deviceName
+      );
+    }
+    return this.cachedAnnounce;
   }
 
   /**
-   * Initiate connection to a peer
+   * Invalidate cached announce (call when something changes)
    */
-  connect(peerId: string): void {
-    const peer = this.peers.get(peerId);
+  invalidateAnnounce(): void {
+    this.cachedAnnounce = null;
+  }
+
+  /**
+   * Send a chat message to a peer (0-RTT if we have their key)
+   */
+  async sendChat(peerId: string, text: string): Promise<number> {
+    let peer = this.peers.get(peerId);
+
     if (!peer) {
       this.emit({ type: 'error', message: `Unknown peer: ${peerId}` });
-      return;
+      return -1;
     }
 
-    if (peer.state !== ConnectionState.DISCONNECTED) {
-      return;
-    }
-
-    const packet = createSynPacket(this.deviceId, peerId, peer.sendSeq++, {
-      publicKey: this.publicKey,
-      name: this.deviceName,
-    });
-
-    peer.state = ConnectionState.SYN_SENT;
-    peer.pendingPackets.push(packet);
-    this.logPacket(packet, 'sent', 'pending');
-    this.emit({ type: 'packet_sent', packet });
-  }
-
-  /**
-   * Send a chat message to a connected peer
-   */
-  async sendChat(peerId: string, text: string): Promise<void> {
-    const peer = this.peers.get(peerId);
-    if (!peer || peer.state !== ConnectionState.ESTABLISHED) {
-      this.emit({ type: 'error', message: 'Peer not connected' });
-      return;
-    }
-
+    const pn = this.getNextPn();
     let payload: ChatPayload;
 
+    // Include our ACK ranges so peer knows what we've received
+    const acks = peer.receivedPns.length > 0 ? peer.receivedPns : undefined;
+
     if (peer.sharedKey) {
+      // Encrypted (0-RTT - we have their key)
       const { ciphertext, iv } = await encrypt(peer.sharedKey, text);
-      payload = { encrypted: true, ciphertext, iv };
+      payload = { enc: true, ct: ciphertext, iv };
     } else {
-      payload = { encrypted: false, plaintext: text };
+      // Need to send INITIAL with our key first
+      const initialPn = this.getNextPn();
+      const initialPacket = createInitialPacket(
+        this.deviceId,
+        peerId,
+        initialPn,
+        this.publicKey,
+        this.deviceName,
+        acks
+      );
+
+      this.trackSentPacket(peer, initialPacket);
+      this.emit({ type: 'packet_sent', packet: initialPacket });
+
+      // Send plaintext for now (will be encrypted after key exchange)
+      payload = { enc: false, pt: text };
     }
 
-    const packet = createDataPacket(
+    const packet = createChatPacket(
       this.deviceId,
       peerId,
-      peer.sendSeq++,
-      peer.recvSeq,
-      MESSAGE_TYPES.CHAT,
-      payload
+      pn,
+      payload,
+      acks
     );
 
-    peer.pendingPackets.push(packet);
-    this.logPacket(packet, 'sent', 'pending');
+    this.trackSentPacket(peer, packet);
     this.emit({ type: 'packet_sent', packet });
 
     const message: ChatMessage = {
@@ -284,54 +345,59 @@ export class MeshState {
       text,
       timestamp: Date.now(),
       encrypted: !!peer.sharedKey,
+      pn,
     };
     this.chatHistory.push(message);
     this.emit({ type: 'chat_message', message });
+
+    return pn;
   }
 
   /**
    * Send connection upgrade offer to a peer
    */
-  sendOffer(peerId: string, offer: OfferPayload): void {
+  sendOffer(peerId: string, offer: OfferPayload): number {
     const peer = this.peers.get(peerId);
-    if (!peer || peer.state !== ConnectionState.ESTABLISHED) {
-      this.emit({ type: 'error', message: 'Peer not connected' });
-      return;
+    if (!peer) {
+      this.emit({ type: 'error', message: `Unknown peer: ${peerId}` });
+      return -1;
     }
+
+    const pn = this.getNextPn();
+    const acks = peer.receivedPns.length > 0 ? peer.receivedPns : undefined;
 
     const packet = createDataPacket(
       this.deviceId,
       peerId,
-      peer.sendSeq++,
-      peer.recvSeq,
+      pn,
       MESSAGE_TYPES.OFFER,
-      offer
+      offer,
+      acks
     );
 
-    peer.pendingPackets.push(packet);
-    this.logPacket(packet, 'sent', 'pending');
+    this.trackSentPacket(peer, packet);
     this.emit({ type: 'packet_sent', packet });
+
+    return pn;
   }
 
   /**
-   * Disconnect from a peer
+   * Send a pure ACK packet (useful when we have nothing else to send)
    */
-  disconnect(peerId: string): void {
+  sendAck(peerId: string): void {
     const peer = this.peers.get(peerId);
-    if (!peer || peer.state !== ConnectionState.ESTABLISHED) {
-      return;
-    }
+    if (!peer || peer.receivedPns.length === 0) return;
 
-    const packet = createFinPacket(
+    const pn = this.getNextPn();
+    const packet = createAckPacket(
       this.deviceId,
       peerId,
-      peer.sendSeq++,
-      peer.recvSeq
+      pn,
+      peer.receivedPns
     );
 
-    peer.state = ConnectionState.FIN_WAIT;
-    peer.pendingPackets.push(packet);
-    this.logPacket(packet, 'sent', 'pending');
+    // ACK packets don't need tracking (they're fire-and-forget)
+    this.logPacket(packet, 'sent');
     this.emit({ type: 'packet_sent', packet });
   }
 
@@ -352,17 +418,45 @@ export class MeshState {
     this.logPacket(packet, 'received');
     this.emit({ type: 'packet_received', packet });
 
+    // Get or create peer
+    let peer = this.peers.get(packet.src);
+    const isNewPeer = !peer;
+
+    if (!peer) {
+      // Extract public key from packet if available
+      let publicKey = '';
+      if (packet.t === PACKET_TYPES.INITIAL) {
+        const payload = packet.p as InitialPayload;
+        publicKey = payload?.key || '';
+      }
+      if (!publicKey) {
+        // Can't create peer without public key
+        return;
+      }
+      peer = this.createPeer(packet.src, publicKey);
+    }
+
+    peer.lastSeen = Date.now();
+
+    // Track received packet number
+    peer.receivedPns = addToAckRanges(peer.receivedPns, packet.pn);
+
+    // Process ACKs from peer (if any)
+    if (packet.acks && packet.acks.length > 0) {
+      this.processAcks(peer, packet.acks);
+    }
+
     // Handle based on packet type
-    if (hasFlag(packet, 'SYN') && !hasFlag(packet, 'ACK')) {
-      await this.handleSyn(packet);
-    } else if (hasFlag(packet, 'SYN') && hasFlag(packet, 'ACK')) {
-      await this.handleSynAck(packet);
-    } else if (hasFlag(packet, 'ACK') && !hasFlag(packet, 'SYN') && !hasFlag(packet, 'FIN')) {
-      this.handleAck(packet);
-    } else if (hasFlag(packet, 'FIN')) {
-      this.handleFin(packet);
-    } else if (hasFlag(packet, 'DATA')) {
-      await this.handleData(packet);
+    switch (packet.t) {
+      case PACKET_TYPES.INITIAL:
+        await this.handleInitial(peer, packet, isNewPeer);
+        break;
+      case PACKET_TYPES.DATA:
+        await this.handleData(peer, packet);
+        break;
+      case PACKET_TYPES.ACK:
+        // Already processed acks above
+        break;
     }
   }
 
@@ -371,233 +465,137 @@ export class MeshState {
    */
   processAnnounce(packet: QRPacket): void {
     if (packet.src === this.deviceId) return;
-    if (packet.type !== MESSAGE_TYPES.ANNOUNCE) return;
+    if (packet.mt !== MESSAGE_TYPES.ANNOUNCE) return;
 
-    const payload = packet.payload as AnnouncePayload;
-    if (!payload?.publicKey) return;
+    const payload = packet.p as AnnouncePayload;
+    if (!payload?.key) return;
 
     let peer = this.peers.get(packet.src);
     if (!peer) {
-      peer = this.createPeer(packet.src, payload.publicKey, payload.name);
+      peer = this.createPeer(packet.src, payload.key, payload.name);
       this.emit({ type: 'peer_discovered', peer });
     } else {
       peer.lastSeen = Date.now();
       if (payload.name) peer.name = payload.name;
+      this.emit({ type: 'peer_updated', peer });
     }
   }
 
   /**
-   * Mark a packet as displayed (for queue management)
+   * Mark a packet as displayed (for retry timing)
    */
   markPacketDisplayed(packet: QRPacket): void {
-    const queueIndex = this.outgoingQueue.findIndex(
-      (p) => p.src === packet.src && p.seq === packet.seq
-    );
-    if (queueIndex !== -1) {
-      this.outgoingQueue.splice(queueIndex, 1);
+    const peer = this.peers.get(packet.dst);
+    if (!peer) return;
+
+    const sent = peer.sentPackets.get(packet.pn);
+    if (sent && sent.status === 'pending') {
+      sent.timestamp = Date.now();
+      sent.retries++;
     }
   }
 
   /**
-   * Check for packets that need retransmission
+   * Check for packets that have exceeded max retries
    */
   checkRetries(): void {
     const now = Date.now();
+
     for (const peer of this.peers.values()) {
-      peer.pendingPackets = peer.pendingPackets.filter((packet) => {
-        const logEntry = this.packetLog.find(
-          (e) =>
-            e.direction === 'sent' &&
-            e.packet.src === packet.src &&
-            e.packet.seq === packet.seq
-        );
-        if (!logEntry) return true;
+      for (const [pn, sent] of peer.sentPackets) {
+        if (sent.status !== 'pending') continue;
 
-        if (now - logEntry.timestamp > this.retryTimeout) {
-          const retryCount = this.packetLog.filter(
-            (e) =>
-              e.direction === 'sent' &&
-              e.packet.src === packet.src &&
-              e.packet.seq === packet.seq
-          ).length;
+        if (now - sent.timestamp > this.retryTimeout && sent.retries >= this.maxRetries) {
+          sent.status = 'failed';
+          this.emit({ type: 'packet_failed', pn, peerId: peer.id });
 
-          if (retryCount >= this.maxRetries) {
-            logEntry.status = 'failed';
-            return false;
-          }
-
-          this.logPacket(packet, 'sent', 'pending');
-          return true;
+          // Update log
+          this.packetLog.forEach((entry) => {
+            if (entry.packet.pn === pn && entry.packet.dst === peer.id) {
+              entry.status = 'failed';
+            }
+          });
         }
-        return true;
-      });
+      }
     }
   }
 
   // Private handlers
 
-  private async handleSyn(packet: QRPacket): Promise<void> {
-    const payload = packet.payload as AnnouncePayload | undefined;
-    let peer = this.peers.get(packet.src);
+  private async handleInitial(peer: Peer, packet: QRPacket, isNewPeer: boolean): Promise<void> {
+    const payload = packet.p as InitialPayload;
 
-    if (!peer && payload?.publicKey) {
-      peer = this.createPeer(packet.src, payload.publicKey, payload.name);
+    if (payload?.key && !peer.sharedKey) {
+      try {
+        peer.sharedKey = await deriveSharedKey(this.keyPair.privateKey, payload.key);
+      } catch (e) {
+        console.error('Failed to derive shared key:', e);
+      }
+    }
+
+    if (payload?.name) {
+      peer.name = payload.name;
+    }
+
+    if (isNewPeer) {
       this.emit({ type: 'peer_discovered', peer });
+    } else {
+      this.emit({ type: 'peer_updated', peer });
     }
 
-    if (!peer) return;
+    // Send our INITIAL back (0-RTT key exchange)
+    if (!peer.sharedKey) return;
 
-    peer.lastSeen = Date.now();
-    peer.recvSeq = packet.seq + 1;
-
-    if (payload?.publicKey && !peer.sharedKey) {
-      try {
-        peer.sharedKey = await deriveSharedKey(this.keyPair.privateKey, payload.publicKey);
-      } catch (e) {
-        console.error('Failed to derive shared key:', e);
-      }
-    }
-
-    const response = createSynAckPacket(
+    const pn = this.getNextPn();
+    const response = createInitialPacket(
       this.deviceId,
-      packet.src,
-      peer.sendSeq++,
-      peer.recvSeq,
-      { publicKey: this.publicKey, name: this.deviceName }
+      peer.id,
+      pn,
+      this.publicKey,
+      this.deviceName,
+      peer.receivedPns
     );
 
-    peer.state = ConnectionState.SYN_RECEIVED;
-    peer.pendingPackets.push(response);
-    this.logPacket(response, 'sent', 'pending');
+    this.trackSentPacket(peer, response);
     this.emit({ type: 'packet_sent', packet: response });
   }
 
-  private async handleSynAck(packet: QRPacket): Promise<void> {
-    const peer = this.peers.get(packet.src);
-    if (!peer || peer.state !== ConnectionState.SYN_SENT) {
-      return;
-    }
-
-    const payload = packet.payload as AnnouncePayload | undefined;
-
-    peer.lastSeen = Date.now();
-    peer.recvSeq = packet.seq + 1;
-
-    if (payload?.publicKey && !peer.sharedKey) {
-      try {
-        peer.sharedKey = await deriveSharedKey(this.keyPair.privateKey, payload.publicKey);
-      } catch (e) {
-        console.error('Failed to derive shared key:', e);
-      }
-    }
-
-    peer.pendingPackets = peer.pendingPackets.filter(
-      (p) => !(hasFlag(p, 'SYN') && !hasFlag(p, 'ACK'))
-    );
-
-    const response = createAckPacket(
-      this.deviceId,
-      packet.src,
-      peer.sendSeq++,
-      peer.recvSeq
-    );
-
-    peer.state = ConnectionState.ESTABLISHED;
-    this.outgoingQueue.push(response);
-    this.logPacket(response, 'sent');
-    this.emit({ type: 'packet_sent', packet: response });
-    this.emit({ type: 'peer_connected', peer });
-  }
-
-  private handleAck(packet: QRPacket): void {
-    const peer = this.peers.get(packet.src);
-    if (!peer) return;
-
-    peer.lastSeen = Date.now();
-    peer.pendingPackets = peer.pendingPackets.filter((p) => p.seq >= packet.ack);
-
-    this.packetLog.forEach((entry) => {
-      if (
-        entry.direction === 'sent' &&
-        entry.packet.dst === packet.src &&
-        entry.packet.seq < packet.ack
-      ) {
-        entry.status = 'acked';
-      }
-    });
-
-    if (peer.state === ConnectionState.SYN_RECEIVED) {
-      peer.state = ConnectionState.ESTABLISHED;
-      this.emit({ type: 'peer_connected', peer });
-    }
-  }
-
-  private handleFin(packet: QRPacket): void {
-    const peer = this.peers.get(packet.src);
-    if (!peer) return;
-
-    peer.lastSeen = Date.now();
-
-    const response = createAckPacket(
-      this.deviceId,
-      packet.src,
-      peer.sendSeq++,
-      packet.seq + 1
-    );
-
-    peer.state = ConnectionState.CLOSED;
-    this.outgoingQueue.push(response);
-    this.logPacket(response, 'sent');
-    this.emit({ type: 'packet_sent', packet: response });
-    this.emit({ type: 'peer_disconnected', peer });
-  }
-
-  private async handleData(packet: QRPacket): Promise<void> {
-    const peer = this.peers.get(packet.src);
-    if (!peer || peer.state !== ConnectionState.ESTABLISHED) {
-      return;
-    }
-
-    peer.lastSeen = Date.now();
-    peer.recvSeq = packet.seq + 1;
-
-    const ack = createAckPacket(
-      this.deviceId,
-      packet.src,
-      peer.sendSeq,
-      peer.recvSeq
-    );
-    this.outgoingQueue.push(ack);
-    this.logPacket(ack, 'sent');
-
-    switch (packet.type) {
+  private async handleData(peer: Peer, packet: QRPacket): Promise<void> {
+    switch (packet.mt) {
       case MESSAGE_TYPES.CHAT:
-        await this.handleChatMessage(peer, packet.payload as ChatPayload);
+        await this.handleChatMessage(peer, packet.p as ChatPayload, packet.pn);
         break;
       case MESSAGE_TYPES.OFFER:
-        this.handleOffer(peer, packet.payload as OfferPayload);
+        this.handleOffer(peer, packet.p as OfferPayload);
         break;
       case MESSAGE_TYPES.ANNOUNCE:
-        const announcePayload = packet.payload as AnnouncePayload;
-        if (announcePayload.name) {
+        const announcePayload = packet.p as AnnouncePayload;
+        if (announcePayload?.name) {
           peer.name = announcePayload.name;
+        }
+        if (announcePayload?.key && !peer.sharedKey) {
+          try {
+            peer.sharedKey = await deriveSharedKey(this.keyPair.privateKey, announcePayload.key);
+          } catch (e) {
+            console.error('Failed to derive shared key:', e);
+          }
         }
         break;
     }
   }
 
-  private async handleChatMessage(peer: Peer, payload: ChatPayload): Promise<void> {
+  private async handleChatMessage(peer: Peer, payload: ChatPayload, pn: number): Promise<void> {
     let text: string;
 
-    if (payload.encrypted && payload.ciphertext && payload.iv && peer.sharedKey) {
+    if (payload.enc && payload.ct && payload.iv && peer.sharedKey) {
       try {
-        text = await decrypt(peer.sharedKey, payload.ciphertext, payload.iv);
+        text = await decrypt(peer.sharedKey, payload.ct, payload.iv);
       } catch (e) {
         console.error('Failed to decrypt message:', e);
         text = '[Decryption failed]';
       }
-    } else if (payload.plaintext) {
-      text = payload.plaintext;
+    } else if (payload.pt) {
+      text = payload.pt;
     } else {
       text = '[Invalid message]';
     }
@@ -607,7 +605,8 @@ export class MeshState {
       direction: 'received',
       text,
       timestamp: Date.now(),
-      encrypted: !!payload.encrypted,
+      encrypted: !!payload.enc,
+      pn,
     };
 
     this.chatHistory.push(message);
@@ -619,19 +618,52 @@ export class MeshState {
     this.emit({ type: 'offer_received', peerId: peer.id, offer });
   }
 
+  private processAcks(peer: Peer, acks: AckRange[]): void {
+    // Update our knowledge of what peer has received
+    for (const [start, end] of acks) {
+      for (let pn = start; pn <= end; pn++) {
+        const sent = peer.sentPackets.get(pn);
+        if (sent && sent.status === 'pending') {
+          sent.status = 'acked';
+          this.emit({ type: 'packet_acked', pn, peerId: peer.id });
+
+          // Update log
+          this.packetLog.forEach((entry) => {
+            if (entry.packet.pn === pn && entry.packet.dst === peer.id) {
+              entry.status = 'acked';
+            }
+          });
+        }
+      }
+    }
+
+    // Update peer's acked ranges
+    peer.ackedByPeer = acks;
+  }
+
   private createPeer(id: string, publicKey: string, name?: string): Peer {
     const peer: Peer = {
       id,
       publicKey,
       name,
-      state: ConnectionState.DISCONNECTED,
       lastSeen: Date.now(),
-      sendSeq: 0,
-      recvSeq: 0,
-      pendingPackets: [],
+      receivedPns: [],
+      ackedByPeer: [],
+      nextPn: 0,
+      sentPackets: new Map(),
     };
     this.peers.set(id, peer);
     return peer;
+  }
+
+  private trackSentPacket(peer: Peer, packet: QRPacket): void {
+    peer.sentPackets.set(packet.pn, {
+      packet,
+      timestamp: Date.now(),
+      retries: 0,
+      status: 'pending',
+    });
+    this.logPacket(packet, 'sent', 'pending');
   }
 
   private logPacket(
@@ -651,3 +683,6 @@ export class MeshState {
     }
   }
 }
+
+// Re-export types that consumers might need
+export type { AckRange } from './protocol';
