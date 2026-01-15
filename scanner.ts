@@ -164,9 +164,16 @@ export class QRScanner {
       this.canvas.height
     );
 
+    // Log image data stats occasionally
+    if (this.scanCount % 50 === 1) {
+      console.log('[SCANNER] Image data:', imageData.width, 'x', imageData.height,
+        'bytes:', imageData.data.length,
+        'first pixels:', imageData.data.slice(0, 12).join(','));
+    }
+
     // Attempt to decode QR code
     const code = jsQR(imageData.data, imageData.width, imageData.height, {
-      inversionAttempts: 'dontInvert',
+      inversionAttempts: 'attemptBoth',  // Try both normal and inverted
     });
 
     if (code && code.data) {
