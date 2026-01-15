@@ -9,7 +9,7 @@
 
 import QRCode from 'qrcode';
 import { getOrCreateKeyPair, type KeyPair, type KeyStorage } from './crypto';
-import { encodePacket, decodePacket, MESSAGE_TYPES, type QRPacket } from './protocol';
+import { encodePacket, decodePacket, PACKET_TYPES, type QRPacket } from './protocol';
 import { QRScanner } from './scanner';
 import { MeshState, type MeshEvent, type Peer } from './mesh';
 
@@ -486,9 +486,9 @@ export class QRTCPDemoElement extends HTMLElement {
     const packet = decodePacket(data);
     if (!packet) return;
 
-    // Process all packets - QUIC style doesn't distinguish announce vs data at scan level
-    if (packet.mt === MESSAGE_TYPES.ANNOUNCE && packet.dst === '*') {
-      this.mesh.processAnnounce(packet);
+    // Process based on packet type
+    if (packet.t === PACKET_TYPES.BEACON) {
+      this.mesh.processBeacon(packet);
     } else {
       this.mesh.processPacket(packet);
     }
@@ -675,7 +675,7 @@ export class QRTCPDemoElement extends HTMLElement {
   private formatPacket(packet: QRPacket): string {
     const parts: string[] = [packet.t];
     if (packet.mt) parts.push(packet.mt);
-    const acksInfo = packet.acks ? ` acks=${JSON.stringify(packet.acks)}` : '';
+    const acksInfo = packet.acks && packet.acks.length > 0 ? ` acks=${packet.acks.map(([s,e]) => s===e ? s : `${s}-${e}`).join(',')}` : '';
     return `${parts.join(' ')} pn=${packet.pn}${acksInfo}`;
   }
 

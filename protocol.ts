@@ -1,170 +1,195 @@
 /**
- * QR-QUIC Protocol - QUIC-inspired packet format for QR transmission
+ * QR-QUIC Protocol v3 - Ultra-compact format for QR transmission
  *
- * Key differences from TCP-style:
- * - No connection handshake (0-RTT with cached keys)
- * - Packet numbers instead of sequence numbers (monotonic, never reused)
- * - SACK-style ACK ranges for efficient acknowledgment
- * - Connectionless feel - each packet is self-contained
+ * Uses pipe-delimited format instead of JSON for minimal size:
+ * - Beacon: Q3|B|{id}|{name}  (~20 bytes)
+ * - Initial: Q3|I|{src}|{dst}|{pn}|{key}|{name}|{acks}
+ * - Data: Q3|D|{src}|{dst}|{pn}|{mt}|{payload}|{acks}
+ * - Ack: Q3|A|{src}|{dst}|{pn}|{acks}
  */
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_PREFIX = 'Q3';
 export const BROADCAST_ADDR = '*';
 
-// Packet types (replacing TCP-style flags)
+// Packet types (single char)
 export const PACKET_TYPES = {
-  INITIAL: 'I',   // First contact - includes public key
-  DATA: 'D',      // Regular data packet
+  BEACON: 'B',    // Minimal presence broadcast (no key)
+  INITIAL: 'I',   // Key exchange
+  DATA: 'D',      // Regular data
   ACK: 'A',       // Pure acknowledgment
 } as const;
 
 // Message types for DATA packets
 export const MESSAGE_TYPES = {
-  ANNOUNCE: 'ANN',
-  CHAT: 'CHT',
-  OFFER: 'OFR',
-  ROUTE: 'RTE',
+  CHAT: 'C',
+  OFFER: 'O',
 } as const;
 
 export type PacketType = (typeof PACKET_TYPES)[keyof typeof PACKET_TYPES];
 export type MessageType = (typeof MESSAGE_TYPES)[keyof typeof MESSAGE_TYPES];
 
 // ACK range: [start, end] inclusive
-// e.g., [[1,5], [7,9]] means "received packets 1-5 and 7-9, missing 6"
 export type AckRange = [number, number];
 
 /**
- * Core packet structure (QUIC-style)
+ * Parsed packet structure
  */
 export interface QRPacket {
-  v: number;          // Protocol version
-  src: string;        // Source device ID (8 chars)
-  dst: string;        // Destination ID or '*' for broadcast
-  pn: number;         // Packet number (monotonic, never reused)
-  t: PacketType;      // Packet type
-  acks?: AckRange[];  // SACK ranges of received packet numbers
-  mt?: MessageType;   // Message type (for DATA packets)
-  p?: unknown;        // Payload
-  crc: string;        // CRC16 checksum
+  v: number;
+  t: PacketType;
+  src: string;
+  dst: string;
+  pn: number;
+  mt?: MessageType;
+  key?: string;       // Public key (INITIAL only)
+  name?: string;      // Device name
+  payload?: string;   // Message payload (already JSON for complex data)
+  acks?: AckRange[];
 }
 
 /**
- * Payload for INITIAL packets (key exchange)
- */
-export interface InitialPayload {
-  key: string;        // Base64 encoded public key
-  name?: string;      // Optional device name
-}
-
-/**
- * Payload for ANNOUNCE messages
- */
-export interface AnnouncePayload {
-  key: string;        // Base64 encoded public key
-  name?: string;      // Optional device name
-}
-
-/**
- * Payload for OFFER messages (connection upgrade)
- */
-export interface OfferPayload {
-  wsUrl?: string;     // WebSocket URL
-  webrtcSdp?: string; // WebRTC SDP offer
-  ipPort?: string;    // IP:port for direct connection
-}
-
-/**
- * Payload for ROUTE messages (mesh routing)
- */
-export interface RoutePayload {
-  reachable: string[];              // List of device IDs this node can reach
-  hops: Record<string, number>;     // Device ID -> hop count
-}
-
-/**
- * Payload for CHAT messages
+ * Chat payload (embedded as JSON in payload field)
  */
 export interface ChatPayload {
-  enc?: boolean;      // Encrypted?
-  ct?: string;        // Ciphertext
-  iv?: string;        // IV
-  pt?: string;        // Plaintext (only for unencrypted)
+  e?: boolean;   // encrypted?
+  c?: string;    // ciphertext
+  i?: string;    // iv
+  p?: string;    // plaintext
 }
 
 /**
- * Calculate CRC16 (CCITT) for packet integrity
+ * Offer payload
  */
-function crc16(str: string): string {
-  let crc = 0xffff;
-  for (let i = 0; i < str.length; i++) {
-    crc ^= str.charCodeAt(i) << 8;
-    for (let j = 0; j < 8; j++) {
-      if (crc & 0x8000) {
-        crc = (crc << 1) ^ 0x1021;
-      } else {
-        crc <<= 1;
-      }
+export interface OfferPayload {
+  ws?: string;   // WebSocket URL
+  rtc?: string;  // WebRTC SDP
+  ip?: string;   // IP:port
+}
+
+/**
+ * Encode ACK ranges compactly: "1-5,7,9-12"
+ */
+function encodeAcks(acks: AckRange[]): string {
+  if (!acks || acks.length === 0) return '';
+  return acks.map(([start, end]) =>
+    start === end ? String(start) : `${start}-${end}`
+  ).join(',');
+}
+
+/**
+ * Decode ACK ranges from compact format
+ */
+function decodeAcks(str: string): AckRange[] {
+  if (!str) return [];
+  return str.split(',').map(part => {
+    if (part.includes('-')) {
+      const [start, end] = part.split('-').map(Number);
+      return [start, end] as AckRange;
     }
-    crc &= 0xffff;
-  }
-  return crc.toString(16).padStart(4, '0');
+    const n = Number(part);
+    return [n, n] as AckRange;
+  });
 }
 
 /**
- * Create a packet with CRC
- */
-export function createPacket(params: Omit<QRPacket, 'v' | 'crc'>): QRPacket {
-  const packet: QRPacket = {
-    v: PROTOCOL_VERSION,
-    src: params.src,
-    dst: params.dst,
-    pn: params.pn,
-    t: params.t,
-    crc: '',
-  };
-
-  if (params.acks && params.acks.length > 0) packet.acks = params.acks;
-  if (params.mt) packet.mt = params.mt;
-  if (params.p !== undefined) packet.p = params.p;
-
-  // Calculate CRC over all fields except crc itself
-  const crcData = JSON.stringify({ ...packet, crc: undefined });
-  packet.crc = crc16(crcData);
-
-  return packet;
-}
-
-/**
- * Encode packet to JSON string for QR code
+ * Encode packet to compact string
  */
 export function encodePacket(packet: QRPacket): string {
-  return JSON.stringify(packet);
+  const parts: string[] = [PROTOCOL_PREFIX];
+
+  switch (packet.t) {
+    case PACKET_TYPES.BEACON:
+      // Q3|B|{id}|{name}
+      parts.push('B', packet.src, packet.name || '');
+      break;
+
+    case PACKET_TYPES.INITIAL:
+      // Q3|I|{src}|{dst}|{pn}|{key}|{name}|{acks}
+      parts.push('I', packet.src, packet.dst, String(packet.pn),
+        packet.key || '', packet.name || '', encodeAcks(packet.acks || []));
+      break;
+
+    case PACKET_TYPES.DATA:
+      // Q3|D|{src}|{dst}|{pn}|{mt}|{payload}|{acks}
+      parts.push('D', packet.src, packet.dst, String(packet.pn),
+        packet.mt || '', packet.payload || '', encodeAcks(packet.acks || []));
+      break;
+
+    case PACKET_TYPES.ACK:
+      // Q3|A|{src}|{dst}|{pn}|{acks}
+      parts.push('A', packet.src, packet.dst, String(packet.pn),
+        encodeAcks(packet.acks || []));
+      break;
+  }
+
+  return parts.join('|');
 }
 
 /**
- * Decode packet from JSON string, verify CRC
+ * Decode packet from compact string
  */
 export function decodePacket(data: string): QRPacket | null {
   try {
-    const packet = JSON.parse(data) as QRPacket;
-
-    // Version check
-    if (packet.v !== PROTOCOL_VERSION) {
-      console.warn('Protocol version mismatch:', packet.v, 'expected:', PROTOCOL_VERSION);
+    if (!data.startsWith(PROTOCOL_PREFIX + '|')) {
       return null;
     }
 
-    // Verify CRC
-    const receivedCrc = packet.crc;
-    const crcData = JSON.stringify({ ...packet, crc: undefined });
-    const expectedCrc = crc16(crcData);
+    const parts = data.split('|');
+    const type = parts[1] as PacketType;
 
-    if (receivedCrc !== expectedCrc) {
-      console.warn('CRC mismatch:', receivedCrc, 'expected:', expectedCrc);
-      return null;
+    switch (type) {
+      case PACKET_TYPES.BEACON:
+        // Q3|B|{id}|{name}
+        return {
+          v: PROTOCOL_VERSION,
+          t: PACKET_TYPES.BEACON,
+          src: parts[2],
+          dst: BROADCAST_ADDR,
+          pn: 0,
+          name: parts[3] || undefined,
+        };
+
+      case PACKET_TYPES.INITIAL:
+        // Q3|I|{src}|{dst}|{pn}|{key}|{name}|{acks}
+        return {
+          v: PROTOCOL_VERSION,
+          t: PACKET_TYPES.INITIAL,
+          src: parts[2],
+          dst: parts[3],
+          pn: Number(parts[4]),
+          key: parts[5] || undefined,
+          name: parts[6] || undefined,
+          acks: decodeAcks(parts[7]),
+        };
+
+      case PACKET_TYPES.DATA:
+        // Q3|D|{src}|{dst}|{pn}|{mt}|{payload}|{acks}
+        return {
+          v: PROTOCOL_VERSION,
+          t: PACKET_TYPES.DATA,
+          src: parts[2],
+          dst: parts[3],
+          pn: Number(parts[4]),
+          mt: (parts[5] as MessageType) || undefined,
+          payload: parts[6] || undefined,
+          acks: decodeAcks(parts[7]),
+        };
+
+      case PACKET_TYPES.ACK:
+        // Q3|A|{src}|{dst}|{pn}|{acks}
+        return {
+          v: PROTOCOL_VERSION,
+          t: PACKET_TYPES.ACK,
+          src: parts[2],
+          dst: parts[3],
+          pn: Number(parts[4]),
+          acks: decodeAcks(parts[5]),
+        };
+
+      default:
+        return null;
     }
-
-    return packet;
   } catch (e) {
     console.warn('Failed to decode packet:', e);
     return null;
@@ -193,7 +218,6 @@ export function addToAckRanges(ranges: AckRange[], pn: number): AckRange[] {
 
   for (const [start, end] of ranges) {
     if (inserted) {
-      // Check if we can merge with previous
       const prev = newRanges[newRanges.length - 1];
       if (prev && start <= prev[1] + 1) {
         prev[1] = Math.max(prev[1], end);
@@ -201,12 +225,10 @@ export function addToAckRanges(ranges: AckRange[], pn: number): AckRange[] {
         newRanges.push([start, end]);
       }
     } else if (pn < start - 1) {
-      // Insert before this range
       newRanges.push([pn, pn]);
       newRanges.push([start, end]);
       inserted = true;
     } else if (pn <= end + 1) {
-      // Merge with this range
       newRanges.push([Math.min(start, pn), Math.max(end, pn)]);
       inserted = true;
     } else {
@@ -218,7 +240,7 @@ export function addToAckRanges(ranges: AckRange[], pn: number): AckRange[] {
     newRanges.push([pn, pn]);
   }
 
-  // Merge any adjacent ranges that resulted from insertion
+  // Merge adjacent
   const merged: AckRange[] = [];
   for (const range of newRanges) {
     const prev = merged[merged.length - 1];
@@ -233,25 +255,25 @@ export function addToAckRanges(ranges: AckRange[], pn: number): AckRange[] {
 }
 
 /**
- * Check if a packet number is acknowledged by the ranges
+ * Check if a packet number is acknowledged
  */
 export function isAcked(ranges: AckRange[], pn: number): boolean {
   for (const [start, end] of ranges) {
     if (pn >= start && pn <= end) return true;
-    if (pn < start) return false; // Ranges are sorted
+    if (pn < start) return false;
   }
   return false;
 }
 
 /**
- * Get missing packet numbers from ranges (up to highest received)
+ * Get missing packet numbers from ranges
  */
-export function getMissing(ranges: AckRange[], _maxPn?: number): number[] {
+export function getMissing(ranges: AckRange[]): number[] {
   if (ranges.length === 0) return [];
 
   const missing: number[] = [];
-
   let expected = ranges[0][0];
+
   for (const [start, end] of ranges) {
     for (let i = expected; i < start; i++) {
       missing.push(i);
@@ -263,7 +285,7 @@ export function getMissing(ranges: AckRange[], _maxPn?: number): number[] {
 }
 
 /**
- * Get the highest acknowledged packet number
+ * Get highest acknowledged packet number
  */
 export function getHighestAcked(ranges: AckRange[]): number {
   if (ranges.length === 0) return -1;
@@ -271,6 +293,17 @@ export function getHighestAcked(ranges: AckRange[]): number {
 }
 
 // Packet factory functions
+
+export function createBeaconPacket(src: string, name?: string): QRPacket {
+  return {
+    v: PROTOCOL_VERSION,
+    t: PACKET_TYPES.BEACON,
+    src,
+    dst: BROADCAST_ADDR,
+    pn: 0,
+    name,
+  };
+}
 
 export function createInitialPacket(
   src: string,
@@ -280,14 +313,16 @@ export function createInitialPacket(
   name?: string,
   acks?: AckRange[]
 ): QRPacket {
-  return createPacket({
+  return {
+    v: PROTOCOL_VERSION,
+    t: PACKET_TYPES.INITIAL,
     src,
     dst,
     pn,
-    t: PACKET_TYPES.INITIAL,
+    key: publicKey,
+    name,
     acks,
-    p: { key: publicKey, name } as InitialPayload,
-  });
+  };
 }
 
 export function createDataPacket(
@@ -295,18 +330,19 @@ export function createDataPacket(
   dst: string,
   pn: number,
   messageType: MessageType,
-  payload: unknown,
+  payload: string,
   acks?: AckRange[]
 ): QRPacket {
-  return createPacket({
+  return {
+    v: PROTOCOL_VERSION,
+    t: PACKET_TYPES.DATA,
     src,
     dst,
     pn,
-    t: PACKET_TYPES.DATA,
     mt: messageType,
-    p: payload,
+    payload,
     acks,
-  });
+  };
 }
 
 export function createAckPacket(
@@ -315,45 +351,34 @@ export function createAckPacket(
   pn: number,
   acks: AckRange[]
 ): QRPacket {
-  return createPacket({
+  return {
+    v: PROTOCOL_VERSION,
+    t: PACKET_TYPES.ACK,
     src,
     dst,
     pn,
-    t: PACKET_TYPES.ACK,
     acks,
-  });
-}
-
-export function createAnnouncePacket(
-  src: string,
-  pn: number,
-  publicKey: string,
-  name?: string
-): QRPacket {
-  return createPacket({
-    src,
-    dst: BROADCAST_ADDR,
-    pn,
-    t: PACKET_TYPES.DATA,
-    mt: MESSAGE_TYPES.ANNOUNCE,
-    p: { key: publicKey, name } as AnnouncePayload,
-  });
+  };
 }
 
 export function createChatPacket(
   src: string,
   dst: string,
   pn: number,
-  payload: ChatPayload,
+  chatPayload: ChatPayload,
   acks?: AckRange[]
 ): QRPacket {
-  return createPacket({
-    src,
-    dst,
-    pn,
-    t: PACKET_TYPES.DATA,
-    mt: MESSAGE_TYPES.CHAT,
-    p: payload,
-    acks,
-  });
+  return createDataPacket(src, dst, pn, MESSAGE_TYPES.CHAT, JSON.stringify(chatPayload), acks);
+}
+
+/**
+ * Parse chat payload from packet
+ */
+export function parseChatPayload(packet: QRPacket): ChatPayload | null {
+  if (!packet.payload) return null;
+  try {
+    return JSON.parse(packet.payload) as ChatPayload;
+  } catch {
+    return null;
+  }
 }

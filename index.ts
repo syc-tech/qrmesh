@@ -1,39 +1,13 @@
 /**
- * QR-QUIC Library
+ * QR-QUIC Library v3
  *
- * A QUIC-inspired protocol for peer-to-peer communication over QR codes.
- * Supports mesh discovery, encrypted messaging, and connection upgrades.
+ * Ultra-compact QUIC-inspired protocol for QR code communication.
  *
  * Key features:
- * - 0-RTT: No handshake needed, send encrypted data immediately
- * - SACK: Selective acknowledgments for efficient delivery tracking
- * - Parallel transmission: Multiple packets in flight simultaneously
- *
- * @example
- * ```typescript
- * import { getOrCreateKeyPair, MeshState, QRScanner, encodePacket, decodePacket } from '@/lib/qrmesh';
- *
- * // Create identity
- * const keyPair = await getOrCreateKeyPair(localStorage);
- *
- * // Create mesh
- * const mesh = new MeshState(keyPair, { deviceName: 'My Device' });
- *
- * // Subscribe to events
- * mesh.subscribe((event) => {
- *   console.log(event.type, event);
- * });
- *
- * // Get packet to display as QR
- * const packet = mesh.getNextOutgoingPacket();
- * const qrData = encodePacket(packet);
- *
- * // Process received QR data
- * const received = decodePacket(scannedData);
- * if (received) {
- *   mesh.processPacket(received);
- * }
- * ```
+ * - Minimal beacons (~15 bytes) for discovery
+ * - 0-RTT messaging with cached keys
+ * - SACK acknowledgments
+ * - Pipe-delimited format instead of JSON
  */
 
 // Crypto exports
@@ -57,6 +31,7 @@ export {
 // Protocol exports
 export {
   PROTOCOL_VERSION,
+  PROTOCOL_PREFIX,
   BROADCAST_ADDR,
   PACKET_TYPES,
   MESSAGE_TYPES,
@@ -64,12 +39,8 @@ export {
   type MessageType,
   type AckRange,
   type QRPacket,
-  type InitialPayload,
-  type AnnouncePayload,
-  type OfferPayload,
-  type RoutePayload,
   type ChatPayload,
-  createPacket,
+  type OfferPayload,
   encodePacket,
   decodePacket,
   isForUs,
@@ -77,11 +48,12 @@ export {
   isAcked,
   getMissing,
   getHighestAcked,
+  createBeaconPacket,
   createInitialPacket,
   createDataPacket,
   createAckPacket,
-  createAnnouncePacket,
   createChatPacket,
+  parseChatPayload,
 } from './protocol';
 
 // Scanner exports
@@ -118,7 +90,7 @@ export function createLocalStorageAdapter(): import('./crypto').KeyStorage {
 }
 
 /**
- * Create an in-memory KeyStorage adapter (for testing or non-persistent use)
+ * Create an in-memory KeyStorage adapter
  */
 export function createMemoryStorageAdapter(): import('./crypto').KeyStorage {
   const store = new Map<string, string>();

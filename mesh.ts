@@ -1,34 +1,30 @@
 /**
- * Mesh State - QUIC-style peer management and packet handling
+ * Mesh State - QUIC-style peer management with ultra-compact packets
  *
- * Key differences from TCP-style:
- * - No connection state machine (no handshake)
- * - SACK-style acknowledgments with ranges
- * - Parallel packet transmission (don't wait for ACKs)
- * - 0-RTT: Send encrypted data immediately if we have peer's key
+ * Protocol v3 uses minimal beacons for discovery, only exchanging
+ * full public keys when actually communicating.
  */
 
 import { KeyPair, deriveSharedKey, encrypt, decrypt } from './crypto';
 import {
   QRPacket,
   AckRange,
+  ChatPayload,
+  OfferPayload,
+  createBeaconPacket,
   createInitialPacket,
   createDataPacket,
   createAckPacket,
-  createAnnouncePacket,
   createChatPacket,
+  parseChatPayload,
   isForUs,
   addToAckRanges,
   PACKET_TYPES,
   MESSAGE_TYPES,
-  InitialPayload,
-  AnnouncePayload,
-  ChatPayload,
-  OfferPayload,
 } from './protocol';
 
 /**
- * Sent packet tracking for delivery status
+ * Sent packet tracking
  */
 export interface SentPacket {
   packet: QRPacket;
@@ -38,25 +34,23 @@ export interface SentPacket {
 }
 
 /**
- * Peer information (simplified from TCP-style)
+ * Peer information
  */
 export interface Peer {
   id: string;
-  publicKey: string;
+  publicKey?: string;         // Only set after INITIAL exchange
   name?: string;
-  sharedKey?: CryptoKey;      // Derived shared key for encryption
+  sharedKey?: CryptoKey;
   lastSeen: number;
-  // SACK tracking
-  receivedPns: AckRange[];    // Packet numbers we've received from this peer
-  ackedByPeer: AckRange[];    // What this peer has acked from us
-  // Outgoing
-  nextPn: number;             // Next packet number to use when sending
-  sentPackets: Map<number, SentPacket>; // pn -> sent packet info
+  receivedPns: AckRange[];
+  ackedByPeer: AckRange[];
+  nextPn: number;
+  sentPackets: Map<number, SentPacket>;
   offer?: OfferPayload;
 }
 
 /**
- * Log entry for packet history
+ * Log entry
  */
 export interface PacketLogEntry {
   timestamp: number;
@@ -74,11 +68,11 @@ export interface ChatMessage {
   text: string;
   timestamp: number;
   encrypted: boolean;
-  pn?: number;  // Packet number for tracking delivery
+  pn?: number;
 }
 
 /**
- * Event types emitted by the mesh
+ * Event types
  */
 export type MeshEvent =
   | { type: 'peer_discovered'; peer: Peer }
@@ -94,17 +88,17 @@ export type MeshEvent =
 export type MeshEventHandler = (event: MeshEvent) => void;
 
 /**
- * Configuration options for MeshState
+ * Config
  */
 export interface MeshConfig {
   deviceName?: string;
-  retryTimeout?: number;  // ms before retrying unacked packet
-  maxRetries?: number;    // max retry attempts
-  maxLogSize?: number;    // max packet log entries
+  retryTimeout?: number;
+  maxRetries?: number;
+  maxLogSize?: number;
 }
 
 /**
- * Mesh state manager (QUIC-style)
+ * Mesh state manager
  */
 export class MeshState {
   private keyPair: KeyPair;
@@ -112,8 +106,8 @@ export class MeshState {
   private packetLog: PacketLogEntry[] = [];
   private chatHistory: ChatMessage[] = [];
   private eventHandlers: Set<MeshEventHandler> = new Set();
-  private globalPn: number = 0;  // Global packet number counter
-  private cachedAnnounce: QRPacket | null = null;
+  private globalPn: number = 0;
+  private cachedBeacon: QRPacket | null = null;
   private deviceName?: string;
   private retryTimeout: number;
   private maxRetries: number;
@@ -127,23 +121,14 @@ export class MeshState {
     this.maxLogSize = config.maxLogSize ?? 100;
   }
 
-  /**
-   * Get this device's ID
-   */
   get deviceId(): string {
     return this.keyPair.deviceId;
   }
 
-  /**
-   * Get this device's public key
-   */
   get publicKey(): string {
     return this.keyPair.publicKeyRaw;
   }
 
-  /**
-   * Subscribe to mesh events
-   */
   subscribe(handler: MeshEventHandler): () => void {
     this.eventHandlers.add(handler);
     return () => this.eventHandlers.delete(handler);
@@ -153,37 +138,22 @@ export class MeshState {
     this.eventHandlers.forEach((handler) => handler(event));
   }
 
-  /**
-   * Get all known peers
-   */
   getPeers(): Peer[] {
     return Array.from(this.peers.values());
   }
 
-  /**
-   * Get a specific peer by ID
-   */
   getPeer(peerId: string): Peer | undefined {
     return this.peers.get(peerId);
   }
 
-  /**
-   * Get peers we can communicate with (have shared key)
-   */
   getActivePeers(): Peer[] {
     return this.getPeers().filter((p) => p.sharedKey !== undefined);
   }
 
-  /**
-   * Get packet log
-   */
   getPacketLog(): PacketLogEntry[] {
     return [...this.packetLog];
   }
 
-  /**
-   * Get chat history, optionally filtered by peer
-   */
   getChatHistory(peerId?: string): ChatMessage[] {
     if (peerId) {
       return this.chatHistory.filter((m) => m.peerId === peerId);
@@ -191,9 +161,6 @@ export class MeshState {
     return [...this.chatHistory];
   }
 
-  /**
-   * Get delivery status for all pending packets to a peer
-   */
   getDeliveryStatus(peerId: string): { pending: number[]; acked: number[]; failed: number[] } {
     const peer = this.peers.get(peerId);
     if (!peer) return { pending: [], acked: [], failed: [] };
@@ -211,18 +178,12 @@ export class MeshState {
     return { pending, acked, failed };
   }
 
-  /**
-   * Get next packet number (monotonically increasing)
-   */
   private getNextPn(): number {
     return this.globalPn++;
   }
 
   /**
-   * Get packets to display as QR codes
-   *
-   * Returns multiple packets that can be shown in sequence
-   * Priority: packets needing retransmission > new data > announce
+   * Get packets to display - returns minimal beacon by default
    */
   getOutgoingPackets(maxPackets: number = 3): QRPacket[] {
     const packets: QRPacket[] = [];
@@ -240,7 +201,7 @@ export class MeshState {
       }
     }
 
-    // Priority 2: Fresh pending packets (not yet due for retry)
+    // Priority 2: Fresh pending packets
     for (const peer of this.peers.values()) {
       for (const [, sent] of peer.sentPackets) {
         if (sent.status === 'pending' && now - sent.timestamp <= this.retryTimeout) {
@@ -250,46 +211,35 @@ export class MeshState {
       }
     }
 
-    // Default: broadcast announce
+    // Default: minimal beacon
     if (packets.length === 0) {
-      packets.push(this.createAnnounce());
+      packets.push(this.createBeacon());
     }
 
     return packets;
   }
 
-  /**
-   * Get next single packet (for compatibility)
-   */
   getNextOutgoingPacket(): QRPacket | null {
     const packets = this.getOutgoingPackets(1);
     return packets[0] || null;
   }
 
   /**
-   * Create an announce packet (cached to avoid QR flickering)
+   * Create minimal beacon (just ID + name, no key!)
    */
-  createAnnounce(): QRPacket {
-    if (!this.cachedAnnounce) {
-      this.cachedAnnounce = createAnnouncePacket(
-        this.deviceId,
-        this.getNextPn(),
-        this.publicKey,
-        this.deviceName
-      );
+  createBeacon(): QRPacket {
+    if (!this.cachedBeacon) {
+      this.cachedBeacon = createBeaconPacket(this.deviceId, this.deviceName);
     }
-    return this.cachedAnnounce;
+    return this.cachedBeacon;
+  }
+
+  invalidateBeacon(): void {
+    this.cachedBeacon = null;
   }
 
   /**
-   * Invalidate cached announce (call when something changes)
-   */
-  invalidateAnnounce(): void {
-    this.cachedAnnounce = null;
-  }
-
-  /**
-   * Send a chat message to a peer (0-RTT if we have their key)
+   * Send chat - will send INITIAL first if no key exchange yet
    */
   async sendChat(peerId: string, text: string): Promise<number> {
     let peer = this.peers.get(peerId);
@@ -300,17 +250,10 @@ export class MeshState {
     }
 
     const pn = this.getNextPn();
-    let payload: ChatPayload;
-
-    // Include our ACK ranges so peer knows what we've received
     const acks = peer.receivedPns.length > 0 ? peer.receivedPns : undefined;
 
-    if (peer.sharedKey) {
-      // Encrypted (0-RTT - we have their key)
-      const { ciphertext, iv } = await encrypt(peer.sharedKey, text);
-      payload = { enc: true, ct: ciphertext, iv };
-    } else {
-      // Need to send INITIAL with our key first
+    // If no shared key yet, send INITIAL first
+    if (!peer.sharedKey) {
       const initialPn = this.getNextPn();
       const initialPacket = createInitialPacket(
         this.deviceId,
@@ -320,22 +263,19 @@ export class MeshState {
         this.deviceName,
         acks
       );
-
       this.trackSentPacket(peer, initialPacket);
       this.emit({ type: 'packet_sent', packet: initialPacket });
-
-      // Send plaintext for now (will be encrypted after key exchange)
-      payload = { enc: false, pt: text };
     }
 
-    const packet = createChatPacket(
-      this.deviceId,
-      peerId,
-      pn,
-      payload,
-      acks
-    );
+    let payload: ChatPayload;
+    if (peer.sharedKey) {
+      const { ciphertext, iv } = await encrypt(peer.sharedKey, text);
+      payload = { e: true, c: ciphertext, i: iv };
+    } else {
+      payload = { e: false, p: text };
+    }
 
+    const packet = createChatPacket(this.deviceId, peerId, pn, payload, acks);
     this.trackSentPacket(peer, packet);
     this.emit({ type: 'packet_sent', packet });
 
@@ -353,9 +293,6 @@ export class MeshState {
     return pn;
   }
 
-  /**
-   * Send connection upgrade offer to a peer
-   */
   sendOffer(peerId: string, offer: OfferPayload): number {
     const peer = this.peers.get(peerId);
     if (!peer) {
@@ -365,13 +302,12 @@ export class MeshState {
 
     const pn = this.getNextPn();
     const acks = peer.receivedPns.length > 0 ? peer.receivedPns : undefined;
-
     const packet = createDataPacket(
       this.deviceId,
       peerId,
       pn,
       MESSAGE_TYPES.OFFER,
-      offer,
+      JSON.stringify(offer),
       acks
     );
 
@@ -381,109 +317,93 @@ export class MeshState {
     return pn;
   }
 
-  /**
-   * Send a pure ACK packet (useful when we have nothing else to send)
-   */
   sendAck(peerId: string): void {
     const peer = this.peers.get(peerId);
     if (!peer || peer.receivedPns.length === 0) return;
 
     const pn = this.getNextPn();
-    const packet = createAckPacket(
-      this.deviceId,
-      peerId,
-      pn,
-      peer.receivedPns
-    );
-
-    // ACK packets don't need tracking (they're fire-and-forget)
+    const packet = createAckPacket(this.deviceId, peerId, pn, peer.receivedPns);
     this.logPacket(packet, 'sent');
     this.emit({ type: 'packet_sent', packet });
   }
 
   /**
-   * Process a received packet
+   * Process received packet
    */
   async processPacket(packet: QRPacket): Promise<void> {
-    // Ignore our own packets
-    if (packet.src === this.deviceId) {
-      return;
-    }
-
-    // Check if packet is for us
-    if (!isForUs(packet, this.deviceId)) {
-      return;
-    }
+    if (packet.src === this.deviceId) return;
+    if (!isForUs(packet, this.deviceId)) return;
 
     this.logPacket(packet, 'received');
     this.emit({ type: 'packet_received', packet });
 
-    // Get or create peer
     let peer = this.peers.get(packet.src);
     const isNewPeer = !peer;
 
+    // Create peer if needed (for INITIAL packets that have key)
     if (!peer) {
-      // Extract public key from packet if available
-      let publicKey = '';
-      if (packet.t === PACKET_TYPES.INITIAL) {
-        const payload = packet.p as InitialPayload;
-        publicKey = payload?.key || '';
+      if (packet.t === PACKET_TYPES.INITIAL && packet.key) {
+        peer = this.createPeer(packet.src, packet.key, packet.name);
+      } else {
+        return; // Can't process without peer
       }
-      if (!publicKey) {
-        // Can't create peer without public key
-        return;
-      }
-      peer = this.createPeer(packet.src, publicKey);
     }
 
     peer.lastSeen = Date.now();
 
-    // Track received packet number
-    peer.receivedPns = addToAckRanges(peer.receivedPns, packet.pn);
+    // Track received pn (except for beacons which always have pn=0)
+    if (packet.t !== PACKET_TYPES.BEACON) {
+      peer.receivedPns = addToAckRanges(peer.receivedPns, packet.pn);
+    }
 
-    // Process ACKs from peer (if any)
+    // Process ACKs
     if (packet.acks && packet.acks.length > 0) {
       this.processAcks(peer, packet.acks);
     }
 
-    // Handle based on packet type
+    // Handle by type
     switch (packet.t) {
+      case PACKET_TYPES.BEACON:
+        // Beacon just updates lastSeen, maybe name
+        if (packet.name) peer.name = packet.name;
+        if (isNewPeer) {
+          this.emit({ type: 'peer_discovered', peer });
+        }
+        break;
+
       case PACKET_TYPES.INITIAL:
         await this.handleInitial(peer, packet, isNewPeer);
         break;
+
       case PACKET_TYPES.DATA:
         await this.handleData(peer, packet);
         break;
+
       case PACKET_TYPES.ACK:
-        // Already processed acks above
+        // Already processed above
         break;
     }
   }
 
   /**
-   * Process a broadcast announce packet
+   * Process beacon (discovery only, no key)
    */
-  processAnnounce(packet: QRPacket): void {
+  processBeacon(packet: QRPacket): void {
     if (packet.src === this.deviceId) return;
-    if (packet.mt !== MESSAGE_TYPES.ANNOUNCE) return;
-
-    const payload = packet.p as AnnouncePayload;
-    if (!payload?.key) return;
+    if (packet.t !== PACKET_TYPES.BEACON) return;
 
     let peer = this.peers.get(packet.src);
     if (!peer) {
-      peer = this.createPeer(packet.src, payload.key, payload.name);
+      // Create peer without key - will get key on INITIAL
+      peer = this.createPeer(packet.src, undefined, packet.name);
       this.emit({ type: 'peer_discovered', peer });
     } else {
       peer.lastSeen = Date.now();
-      if (payload.name) peer.name = payload.name;
+      if (packet.name) peer.name = packet.name;
       this.emit({ type: 'peer_updated', peer });
     }
   }
 
-  /**
-   * Mark a packet as displayed (for retry timing)
-   */
   markPacketDisplayed(packet: QRPacket): void {
     const peer = this.peers.get(packet.dst);
     if (!peer) return;
@@ -495,9 +415,6 @@ export class MeshState {
     }
   }
 
-  /**
-   * Check for packets that have exceeded max retries
-   */
   checkRetries(): void {
     const now = Date.now();
 
@@ -509,7 +426,6 @@ export class MeshState {
           sent.status = 'failed';
           this.emit({ type: 'packet_failed', pn, peerId: peer.id });
 
-          // Update log
           this.packetLog.forEach((entry) => {
             if (entry.packet.pn === pn && entry.packet.dst === peer.id) {
               entry.status = 'failed';
@@ -523,19 +439,16 @@ export class MeshState {
   // Private handlers
 
   private async handleInitial(peer: Peer, packet: QRPacket, isNewPeer: boolean): Promise<void> {
-    const payload = packet.p as InitialPayload;
-
-    if (payload?.key && !peer.sharedKey) {
+    if (packet.key && !peer.sharedKey) {
+      peer.publicKey = packet.key;
       try {
-        peer.sharedKey = await deriveSharedKey(this.keyPair.privateKey, payload.key);
+        peer.sharedKey = await deriveSharedKey(this.keyPair.privateKey, packet.key);
       } catch (e) {
         console.error('Failed to derive shared key:', e);
       }
     }
 
-    if (payload?.name) {
-      peer.name = payload.name;
-    }
+    if (packet.name) peer.name = packet.name;
 
     if (isNewPeer) {
       this.emit({ type: 'peer_discovered', peer });
@@ -543,59 +456,53 @@ export class MeshState {
       this.emit({ type: 'peer_updated', peer });
     }
 
-    // Send our INITIAL back (0-RTT key exchange)
-    if (!peer.sharedKey) return;
-
-    const pn = this.getNextPn();
-    const response = createInitialPacket(
-      this.deviceId,
-      peer.id,
-      pn,
-      this.publicKey,
-      this.deviceName,
-      peer.receivedPns
-    );
-
-    this.trackSentPacket(peer, response);
-    this.emit({ type: 'packet_sent', packet: response });
+    // Respond with our INITIAL
+    if (peer.sharedKey) {
+      const pn = this.getNextPn();
+      const response = createInitialPacket(
+        this.deviceId,
+        peer.id,
+        pn,
+        this.publicKey,
+        this.deviceName,
+        peer.receivedPns
+      );
+      this.trackSentPacket(peer, response);
+      this.emit({ type: 'packet_sent', packet: response });
+    }
   }
 
   private async handleData(peer: Peer, packet: QRPacket): Promise<void> {
     switch (packet.mt) {
       case MESSAGE_TYPES.CHAT:
-        await this.handleChatMessage(peer, packet.p as ChatPayload, packet.pn);
+        await this.handleChat(peer, packet);
         break;
       case MESSAGE_TYPES.OFFER:
-        this.handleOffer(peer, packet.p as OfferPayload);
-        break;
-      case MESSAGE_TYPES.ANNOUNCE:
-        const announcePayload = packet.p as AnnouncePayload;
-        if (announcePayload?.name) {
-          peer.name = announcePayload.name;
-        }
-        if (announcePayload?.key && !peer.sharedKey) {
+        if (packet.payload) {
           try {
-            peer.sharedKey = await deriveSharedKey(this.keyPair.privateKey, announcePayload.key);
-          } catch (e) {
-            console.error('Failed to derive shared key:', e);
-          }
+            const offer = JSON.parse(packet.payload) as OfferPayload;
+            peer.offer = offer;
+            this.emit({ type: 'offer_received', peerId: peer.id, offer });
+          } catch { }
         }
         break;
     }
   }
 
-  private async handleChatMessage(peer: Peer, payload: ChatPayload, pn: number): Promise<void> {
-    let text: string;
+  private async handleChat(peer: Peer, packet: QRPacket): Promise<void> {
+    const payload = parseChatPayload(packet);
+    if (!payload) return;
 
-    if (payload.enc && payload.ct && payload.iv && peer.sharedKey) {
+    let text: string;
+    if (payload.e && payload.c && payload.i && peer.sharedKey) {
       try {
-        text = await decrypt(peer.sharedKey, payload.ct, payload.iv);
+        text = await decrypt(peer.sharedKey, payload.c, payload.i);
       } catch (e) {
-        console.error('Failed to decrypt message:', e);
+        console.error('Decrypt failed:', e);
         text = '[Decryption failed]';
       }
-    } else if (payload.pt) {
-      text = payload.pt;
+    } else if (payload.p) {
+      text = payload.p;
     } else {
       text = '[Invalid message]';
     }
@@ -605,21 +512,15 @@ export class MeshState {
       direction: 'received',
       text,
       timestamp: Date.now(),
-      encrypted: !!payload.enc,
-      pn,
+      encrypted: !!payload.e,
+      pn: packet.pn,
     };
 
     this.chatHistory.push(message);
     this.emit({ type: 'chat_message', message });
   }
 
-  private handleOffer(peer: Peer, offer: OfferPayload): void {
-    peer.offer = offer;
-    this.emit({ type: 'offer_received', peerId: peer.id, offer });
-  }
-
   private processAcks(peer: Peer, acks: AckRange[]): void {
-    // Update our knowledge of what peer has received
     for (const [start, end] of acks) {
       for (let pn = start; pn <= end; pn++) {
         const sent = peer.sentPackets.get(pn);
@@ -627,7 +528,6 @@ export class MeshState {
           sent.status = 'acked';
           this.emit({ type: 'packet_acked', pn, peerId: peer.id });
 
-          // Update log
           this.packetLog.forEach((entry) => {
             if (entry.packet.pn === pn && entry.packet.dst === peer.id) {
               entry.status = 'acked';
@@ -636,12 +536,10 @@ export class MeshState {
         }
       }
     }
-
-    // Update peer's acked ranges
     peer.ackedByPeer = acks;
   }
 
-  private createPeer(id: string, publicKey: string, name?: string): Peer {
+  private createPeer(id: string, publicKey?: string, name?: string): Peer {
     const peer: Peer = {
       id,
       publicKey,
@@ -684,5 +582,4 @@ export class MeshState {
   }
 }
 
-// Re-export types that consumers might need
 export type { AckRange } from './protocol';

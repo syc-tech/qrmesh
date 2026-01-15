@@ -7,7 +7,7 @@
 
 import QRCode from 'qrcode';
 import { getOrCreateKeyPair, type KeyPair, type KeyStorage } from '../crypto';
-import { encodePacket, decodePacket, MESSAGE_TYPES } from '../protocol';
+import { encodePacket, decodePacket, PACKET_TYPES } from '../protocol';
 import { QRScanner } from '../scanner';
 import { MeshState, type MeshEvent } from '../mesh';
 
@@ -619,8 +619,8 @@ export class QRMeshChatElement extends HTMLElement {
     const packet = decodePacket(data);
     if (!packet) return;
 
-    if (packet.mt === MESSAGE_TYPES.ANNOUNCE && packet.dst === '*') {
-      this.mesh.processAnnounce(packet);
+    if (packet.t === PACKET_TYPES.BEACON) {
+      this.mesh.processBeacon(packet);
       // Auto-select peer when discovered
       const peers = this.mesh.getPeers();
       if (peers.length > 0 && !this.activePeerId) {
