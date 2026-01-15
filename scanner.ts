@@ -84,6 +84,7 @@ export class QRScanner {
 
       // Start scanning loop
       this.running = true;
+      console.log('[SCANNER] Started, video size:', this.video.videoWidth, 'x', this.video.videoHeight);
       this.intervalId = setInterval(() => this.scan(), this.scanInterval);
     } catch (error) {
       this.onError?.(error as Error);
@@ -123,12 +124,20 @@ export class QRScanner {
     return this.running;
   }
 
+  private scanCount = 0;
+
   /**
    * Perform a single scan
    */
   private scan(): void {
     if (!this.video || !this.canvas || !this.ctx) return;
     if (this.video.readyState !== this.video.HAVE_ENOUGH_DATA) return;
+
+    // Log every 50 scans to show scanner is working
+    this.scanCount++;
+    if (this.scanCount % 50 === 1) {
+      console.log('[SCANNER] Scan #' + this.scanCount + ', video ready, looking for QR...');
+    }
 
     // Update canvas size if video size changed
     if (
@@ -156,6 +165,7 @@ export class QRScanner {
     });
 
     if (code && code.data) {
+      console.log('[SCANNER] Found QR code:', code.data);
       const now = Date.now();
 
       // Debounce: don't report same QR code repeatedly
@@ -165,6 +175,7 @@ export class QRScanner {
       ) {
         this.lastScannedData = code.data;
         this.lastScanTime = now;
+        console.log('[SCANNER] Reporting scan (not debounced)');
 
         this.onScan({
           data: code.data,
