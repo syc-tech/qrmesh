@@ -337,7 +337,6 @@ export class QRTCPDemoElement extends HTMLElement {
   private keyPair: KeyPair | null = null;
   private mesh: MeshState | null = null;
   private scanner: QRScanner | null = null;
-  private retryInterval: ReturnType<typeof setInterval> | null = null;
   private selectedPeer: string | null = null;
   private deviceName: string = '';
   private lastDisplayedPacket: string | null = null;
@@ -371,7 +370,6 @@ export class QRTCPDemoElement extends HTMLElement {
   }
 
   private cleanup() {
-    if (this.retryInterval) clearInterval(this.retryInterval);
     this.scanner?.stop();
   }
 
@@ -397,16 +395,8 @@ export class QRTCPDemoElement extends HTMLElement {
       this.mesh = new MeshState(this.keyPair, { deviceName: this.deviceName || undefined });
       this.mesh.subscribe((event) => this.handleMeshEvent(event));
 
-      // Show initial beacon (static)
+      // Show initial beacon (static - only changes on scan)
       this.updateQR();
-
-      // Only check retries periodically, update QR only when needed
-      this.retryInterval = setInterval(() => {
-        this.mesh?.checkRetries();
-        if (this.hasPendingPackets()) {
-          this.updateQR();
-        }
-      }, 1000);
 
       this.updateScanStatus('Beacon ready');
     } catch (e) {
@@ -463,14 +453,6 @@ export class QRTCPDemoElement extends HTMLElement {
     }
   }
 
-  private hasPendingPackets(): boolean {
-    if (!this.mesh) return false;
-    for (const peer of this.mesh.getPeers()) {
-      const status = this.mesh.getDeliveryStatus(peer.id);
-      if (status.pending.length > 0) return true;
-    }
-    return false;
-  }
 
   private async startCamera() {
     if (!this.videoEl || this.scanner) return;

@@ -448,7 +448,6 @@ export class QRMeshChatElement extends HTMLElement {
   private keyPair: KeyPair | null = null;
   private mesh: MeshState | null = null;
   private scanner: QRScanner | null = null;
-  private retryInterval: ReturnType<typeof setInterval> | null = null;
   private activePeerId: string | null = null;
   private messageQueue: QueuedMessage[] = [];
   private sentMessages: Array<{ text: string; timestamp: number; pn?: number }> = [];
@@ -480,7 +479,6 @@ export class QRMeshChatElement extends HTMLElement {
   }
 
   disconnectedCallback() {
-    if (this.retryInterval) clearInterval(this.retryInterval);
     if (this.scanFlashTimeout) clearTimeout(this.scanFlashTimeout);
     this.scanner?.stop();
   }
@@ -501,18 +499,8 @@ export class QRMeshChatElement extends HTMLElement {
       this.mesh = new MeshState(this.keyPair, { deviceName: 'Chat Demo' });
       this.mesh.subscribe((event) => this.handleMeshEvent(event));
 
-      // Show initial beacon QR (static until activity)
+      // Show initial beacon QR (static - only changes on scan)
       this.updateQR();
-
-      this.retryInterval = setInterval(() => {
-        this.mesh?.checkRetries();
-        this.processMessageQueue();
-        this.updateDeliveryStatus();
-        // Only update QR if there are pending packets
-        if (this.hasPendingPackets()) {
-          this.updateQR();
-        }
-      }, 1000);
 
       this.updateStatus('Beacon ready', 'idle');
     } catch (e) {
@@ -668,14 +656,6 @@ export class QRMeshChatElement extends HTMLElement {
     this.updateStatus('Scanned!', 'scanning');
   }
 
-  private hasPendingPackets(): boolean {
-    if (!this.mesh) return false;
-    for (const peer of this.mesh.getPeers()) {
-      const status = this.mesh.getDeliveryStatus(peer.id);
-      if (status.pending.length > 0) return true;
-    }
-    return false;
-  }
 
   private queueMessage(text: string) {
     const msg: QueuedMessage = {
