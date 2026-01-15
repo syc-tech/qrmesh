@@ -83,26 +83,26 @@ const styles = `
     display: flex;
     justify-content: center;
     align-items: center;
-    min-height: 180px;
+    min-height: 300px;
   }
 
   .qr-area canvas {
-    max-width: 160px;
-    max-height: 160px;
+    max-width: 280px;
+    max-height: 280px;
   }
 
   .camera-area {
     background: #000;
     border-radius: 0.5rem;
     overflow: hidden;
-    min-height: 180px;
+    min-height: 300px;
     position: relative;
   }
 
   .camera-area video {
     width: 100%;
-    height: 180px;
-    object-fit: cover;
+    height: 300px;
+    object-fit: contain;
   }
 
   .camera-overlay {
@@ -551,9 +551,9 @@ export class QRMeshChatElement extends HTMLElement {
     if (packet) {
       try {
         await QRCode.toCanvas(this.qrCanvas, encodePacket(packet), {
-          width: 160,
+          width: 280,
           margin: 2,
-          errorCorrectionLevel: 'M',
+          errorCorrectionLevel: 'L',
           color: { dark: '#000', light: '#fff' },
         });
         this.mesh.markPacketDisplayed(packet);
@@ -753,7 +753,7 @@ export class QRMeshChatElement extends HTMLElement {
               <span class="panel-title">Your QR Code</span>
             </div>
             <div class="qr-area">
-              <canvas id="qr-canvas" width="160" height="160"></canvas>
+              <canvas id="qr-canvas" width="280" height="280"></canvas>
             </div>
             <div class="status-bar">
               <span class="status-dot" id="status-dot"></span>
