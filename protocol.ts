@@ -98,20 +98,20 @@ function decodeAcks(str: string): AckRange[] {
 export function encodePacket(packet: QRPacket): string {
   switch (packet.t) {
     case PACKET_TYPES.BEACON:
-      // Minimal: QB{id} (just 10 chars for 8-char ID)
-      return `QB${packet.src}`;
+      // Just the 8-char uppercase device ID - smallest possible!
+      return packet.src;
 
     case PACKET_TYPES.INITIAL:
-      // QI{src}{dst}{pn}|{key}|{name}|{acks}
-      return `QI${packet.src}${packet.dst}${packet.pn}|${packet.key || ''}|${packet.name || ''}|${encodeAcks(packet.acks || [])}`;
+      // I{src}{dst}{pn}|{key}|{name}|{acks}
+      return `I${packet.src}${packet.dst}${packet.pn}|${packet.key || ''}|${packet.name || ''}|${encodeAcks(packet.acks || [])}`;
 
     case PACKET_TYPES.DATA:
-      // QD{src}{dst}{pn}{mt}|{payload}|{acks}
-      return `QD${packet.src}${packet.dst}${packet.pn}${packet.mt || ''}|${packet.payload || ''}|${encodeAcks(packet.acks || [])}`;
+      // D{src}{dst}{pn}{mt}|{payload}|{acks}
+      return `D${packet.src}${packet.dst}${packet.pn}${packet.mt || ''}|${packet.payload || ''}|${encodeAcks(packet.acks || [])}`;
 
     case PACKET_TYPES.ACK:
-      // QA{src}{dst}{pn}|{acks}
-      return `QA${packet.src}${packet.dst}${packet.pn}|${encodeAcks(packet.acks || [])}`;
+      // A{src}{dst}{pn}|{acks}
+      return `A${packet.src}${packet.dst}${packet.pn}|${encodeAcks(packet.acks || [])}`;
 
     default:
       return '';
@@ -123,26 +123,25 @@ export function encodePacket(packet: QRPacket): string {
  */
 export function decodePacket(data: string): QRPacket | null {
   try {
-    if (!data.startsWith('Q')) return null;
+    // Beacon: just 8 uppercase hex chars (no prefix)
+    if (/^[0-9A-F]{8}$/.test(data)) {
+      return {
+        v: PROTOCOL_VERSION,
+        t: PACKET_TYPES.BEACON,
+        src: data,
+        dst: BROADCAST_ADDR,
+        pn: 0,
+      };
+    }
 
-    const type = data[1] as PacketType;
+    const type = data[0] as PacketType;
 
     switch (type) {
-      case PACKET_TYPES.BEACON:
-        // QB{id} - 10 chars total
-        return {
-          v: PROTOCOL_VERSION,
-          t: PACKET_TYPES.BEACON,
-          src: data.slice(2, 10),
-          dst: BROADCAST_ADDR,
-          pn: 0,
-        };
-
       case PACKET_TYPES.INITIAL: {
-        // QI{src:8}{dst:8}{pn}|{key}|{name}|{acks}
-        const src = data.slice(2, 10);
-        const dst = data.slice(10, 18);
-        const rest = data.slice(18);
+        // I{src:8}{dst:8}{pn}|{key}|{name}|{acks}
+        const src = data.slice(1, 9);
+        const dst = data.slice(9, 17);
+        const rest = data.slice(17);
         const pnEnd = rest.indexOf('|');
         const pn = Number(rest.slice(0, pnEnd));
         const parts = rest.slice(pnEnd + 1).split('|');
@@ -159,10 +158,10 @@ export function decodePacket(data: string): QRPacket | null {
       }
 
       case PACKET_TYPES.DATA: {
-        // QD{src:8}{dst:8}{pn}{mt:1}|{payload}|{acks}
-        const src = data.slice(2, 10);
-        const dst = data.slice(10, 18);
-        const rest = data.slice(18);
+        // D{src:8}{dst:8}{pn}{mt:1}|{payload}|{acks}
+        const src = data.slice(1, 9);
+        const dst = data.slice(9, 17);
+        const rest = data.slice(17);
         const pipeIdx = rest.indexOf('|');
         const pnAndMt = rest.slice(0, pipeIdx);
         // mt is single char at end if present
@@ -182,10 +181,10 @@ export function decodePacket(data: string): QRPacket | null {
       }
 
       case PACKET_TYPES.ACK: {
-        // QA{src:8}{dst:8}{pn}|{acks}
-        const src = data.slice(2, 10);
-        const dst = data.slice(10, 18);
-        const rest = data.slice(18);
+        // A{src:8}{dst:8}{pn}|{acks}
+        const src = data.slice(1, 9);
+        const dst = data.slice(9, 17);
+        const rest = data.slice(17);
         const pipeIdx = rest.indexOf('|');
         const pn = Number(rest.slice(0, pipeIdx));
         const acks = decodeAcks(rest.slice(pipeIdx + 1));

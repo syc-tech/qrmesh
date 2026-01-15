@@ -147,8 +147,9 @@ async function deriveDeviceId(publicKeyRaw: string): Promise<string> {
   const data = new TextEncoder().encode(publicKeyRaw);
   const hash = await crypto.subtle.digest('SHA-256', data);
   const hashArray = new Uint8Array(hash);
+  // Use UPPERCASE hex for QR alphanumeric mode efficiency
   return Array.from(hashArray.slice(0, 4))
-    .map((b) => b.toString(16).padStart(2, '0'))
+    .map((b) => b.toString(16).padStart(2, '0').toUpperCase())
     .join('');
 }
 
