@@ -387,12 +387,15 @@ export class MeshState {
 
   /**
    * Process beacon (discovery only, no key)
+   * Automatically sends INITIAL to start key exchange
    */
   processBeacon(packet: QRPacket): void {
     if (packet.src === this.deviceId) return;
     if (packet.t !== PACKET_TYPES.BEACON) return;
 
     let peer = this.peers.get(packet.src);
+    const isNew = !peer;
+
     if (!peer) {
       // Create peer without key - will get key on INITIAL
       peer = this.createPeer(packet.src, undefined, packet.name);
@@ -401,6 +404,24 @@ export class MeshState {
       peer.lastSeen = Date.now();
       if (packet.name) peer.name = packet.name;
       this.emit({ type: 'peer_updated', peer });
+    }
+
+    // Auto-send INITIAL to start key exchange (only if we haven't already)
+    if (isNew || !peer.sharedKey) {
+      const existingInitial = Array.from(peer.sentPackets.values())
+        .some(s => s.packet.t === PACKET_TYPES.INITIAL);
+
+      if (!existingInitial) {
+        const pn = this.getNextPn();
+        const initialPacket = createInitialPacket(
+          this.deviceId,
+          peer.id,
+          pn,
+          this.publicKey,
+          this.deviceName
+        );
+        this.trackSentPacket(peer, initialPacket);
+      }
     }
   }
 

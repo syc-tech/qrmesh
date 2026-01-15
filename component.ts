@@ -410,6 +410,7 @@ export class QRTCPDemoElement extends HTMLElement {
       case 'peer_discovered':
       case 'peer_updated':
         this.renderPeerList();
+        this.updateQR(); // Update QR to send INITIAL or respond
         break;
       case 'packet_sent':
       case 'packet_received':

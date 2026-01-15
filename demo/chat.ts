@@ -513,6 +513,7 @@ export class QRMeshChatElement extends HTMLElement {
     switch (event.type) {
       case 'peer_discovered':
         this.updatePeerBadge(event.peer.id, 'discovered');
+        this.updateQR(); // Update QR to send INITIAL
         break;
       case 'peer_updated':
         if (event.peer.sharedKey) {
@@ -521,6 +522,7 @@ export class QRMeshChatElement extends HTMLElement {
           this.updateStatus('Connected (0-RTT)', 'connected');
           this.processMessageQueue();
         }
+        this.updateQR(); // Update QR to respond
         break;
       case 'packet_acked':
         // Update message status
