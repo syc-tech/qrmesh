@@ -189,6 +189,15 @@ export class MeshState {
     const packets: QRPacket[] = [];
     const now = Date.now();
 
+    // Debug: log all peers and their sent packets
+    console.log('[MESH] getOutgoingPackets - peers:', this.peers.size);
+    for (const [id, peer] of this.peers) {
+      console.log('[MESH]   Peer', id, 'sentPackets:', peer.sentPackets.size);
+      for (const [pn, sent] of peer.sentPackets) {
+        console.log('[MESH]     pn:', pn, 'type:', sent.packet.t, 'status:', sent.status, 'age:', now - sent.timestamp);
+      }
+    }
+
     // Priority 1: Packets needing retransmission
     for (const peer of this.peers.values()) {
       for (const [, sent] of peer.sentPackets) {
@@ -411,6 +420,8 @@ export class MeshState {
       const existingInitial = Array.from(peer.sentPackets.values())
         .some(s => s.packet.t === PACKET_TYPES.INITIAL);
 
+      console.log('[MESH] Checking INITIAL:', { isNew, hasKey: !!peer.sharedKey, existingInitial, sentPacketsCount: peer.sentPackets.size });
+
       if (!existingInitial) {
         const pn = this.getNextPn();
         const initialPacket = createInitialPacket(
@@ -420,7 +431,9 @@ export class MeshState {
           this.publicKey,
           this.deviceName
         );
+        console.log('[MESH] Queueing INITIAL packet to', peer.id, 'pn:', pn);
         this.trackSentPacket(peer, initialPacket);
+        console.log('[MESH] After tracking, sentPackets:', peer.sentPackets.size);
       }
     }
   }
