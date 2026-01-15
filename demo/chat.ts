@@ -640,9 +640,7 @@ export class QRMeshChatElement extends HTMLElement {
     } else {
       this.mesh.processPacket(packet);
     }
-
-    // Update QR after receiving a packet (may need to send response)
-    this.updateQR();
+    // Don't update QR here - keep beacon static
   }
 
   private flashScanIndicator() {

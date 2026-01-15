@@ -496,9 +496,7 @@ export class QRTCPDemoElement extends HTMLElement {
     }
 
     this.updateScanStatus(`Scanned: ${packet.src.slice(0, 4)}...`);
-
-    // Update QR after scan (may need to respond)
-    this.updateQR();
+    // Don't update QR here - keep beacon static
   }
 
   private updateScanStatus(text: string) {
