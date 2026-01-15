@@ -84,7 +84,7 @@ export class QRScanner {
 
       // Start scanning loop
       this.running = true;
-      console.log('[SCANNER] Started, video size:', this.video.videoWidth, 'x', this.video.videoHeight);
+      console.log('[SCANNER] v2 Started, video size:', this.video.videoWidth, 'x', this.video.videoHeight);
       this.intervalId = setInterval(() => this.scan(), this.scanInterval);
     } catch (error) {
       this.onError?.(error as Error);
