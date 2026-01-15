@@ -173,9 +173,19 @@ export class QRScanner {
 
     // Log image data stats occasionally
     if (this.scanCount % 50 === 1) {
-      console.log('[SCANNER] Image data:', imageData.width, 'x', imageData.height,
-        'bytes:', imageData.data.length,
-        'first pixels:', Array.from(imageData.data.slice(0, 12)).join(','));
+      // Analyze image brightness to see if QR might be visible
+      let minBrightness = 255, maxBrightness = 0;
+      for (let i = 0; i < imageData.data.length; i += 400) { // Sample every 100th pixel
+        const r = imageData.data[i];
+        const g = imageData.data[i + 1];
+        const b = imageData.data[i + 2];
+        const brightness = (r + g + b) / 3;
+        minBrightness = Math.min(minBrightness, brightness);
+        maxBrightness = Math.max(maxBrightness, brightness);
+      }
+      console.log('[SCANNER] Image:', imageData.width, 'x', imageData.height,
+        'brightness range:', Math.round(minBrightness), '-', Math.round(maxBrightness),
+        '(need 0-255 range for QR)');
     }
 
     // Attempt to decode QR code
