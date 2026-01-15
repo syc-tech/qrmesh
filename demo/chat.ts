@@ -598,9 +598,9 @@ export class QRMeshChatElement extends HTMLElement {
 
       try {
         await QRCode.toCanvas(this.qrCanvas, encoded, {
-          width: 400,
-          margin: 1,
-          errorCorrectionLevel: 'L',
+          width: 500,           // Larger for old cameras
+          margin: 4,            // Bigger quiet zone helps detection
+          errorCorrectionLevel: 'M',  // Better error correction for blur
           color: { dark: '#000', light: '#fff' },
         });
         this.mesh.markPacketDisplayed(packet);

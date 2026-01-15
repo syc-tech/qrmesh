@@ -130,14 +130,19 @@ export class QRScanner {
    * Perform a single scan
    */
   private scan(): void {
+    this.scanCount++;
+
+    // Log every 50 scans
+    if (this.scanCount % 50 === 1) {
+      console.log('[SCANNER] Scan #' + this.scanCount,
+        'video:', !!this.video,
+        'canvas:', !!this.canvas,
+        'readyState:', this.video?.readyState,
+        'HAVE_ENOUGH_DATA:', this.video?.HAVE_ENOUGH_DATA);
+    }
+
     if (!this.video || !this.canvas || !this.ctx) return;
     if (this.video.readyState !== this.video.HAVE_ENOUGH_DATA) return;
-
-    // Log every 50 scans to show scanner is working
-    this.scanCount++;
-    if (this.scanCount % 50 === 1) {
-      console.log('[SCANNER] Scan #' + this.scanCount + ', video ready, looking for QR...');
-    }
 
     // Update canvas size if video size changed
     if (
