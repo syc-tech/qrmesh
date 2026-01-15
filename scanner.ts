@@ -137,12 +137,19 @@ export class QRScanner {
       console.log('[SCANNER] Scan #' + this.scanCount,
         'video:', !!this.video,
         'canvas:', !!this.canvas,
+        'ctx:', !!this.ctx,
         'readyState:', this.video?.readyState,
         'HAVE_ENOUGH_DATA:', this.video?.HAVE_ENOUGH_DATA);
     }
 
-    if (!this.video || !this.canvas || !this.ctx) return;
-    if (this.video.readyState !== this.video.HAVE_ENOUGH_DATA) return;
+    if (!this.video || !this.canvas || !this.ctx) {
+      if (this.scanCount % 50 === 1) console.log('[SCANNER] Early return: missing video/canvas/ctx');
+      return;
+    }
+    if (this.video.readyState !== this.video.HAVE_ENOUGH_DATA) {
+      if (this.scanCount % 50 === 1) console.log('[SCANNER] Early return: video not ready');
+      return;
+    }
 
     // Update canvas size if video size changed
     if (
@@ -168,13 +175,19 @@ export class QRScanner {
     if (this.scanCount % 50 === 1) {
       console.log('[SCANNER] Image data:', imageData.width, 'x', imageData.height,
         'bytes:', imageData.data.length,
-        'first pixels:', imageData.data.slice(0, 12).join(','));
+        'first pixels:', Array.from(imageData.data.slice(0, 12)).join(','));
     }
 
     // Attempt to decode QR code
+    if (this.scanCount % 50 === 1) {
+      console.log('[SCANNER] Calling jsQR...');
+    }
     const code = jsQR(imageData.data, imageData.width, imageData.height, {
       inversionAttempts: 'attemptBoth',  // Try both normal and inverted
     });
+    if (this.scanCount % 50 === 1) {
+      console.log('[SCANNER] jsQR result:', code ? 'FOUND: ' + code.data : 'null');
+    }
 
     if (code && code.data) {
       console.log('[SCANNER] Found QR code:', code.data);
