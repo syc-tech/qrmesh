@@ -533,9 +533,11 @@ export class QRMeshChatElement extends HTMLElement {
         this.updatePeerBadge(event.peer.id, 'discovered');
         break;
       case 'packet_acked':
+        console.log('[Chat] packet_acked event for pn:', event.pn);
         // Update message status
         const ackedMsg = this.messageQueue.find(m => m.pn === event.pn);
         if (ackedMsg) {
+          console.log('[Chat] Found message to mark as acked:', ackedMsg.text);
           ackedMsg.status = 'acked';
           this.sentMessages.push({
             text: ackedMsg.text,
@@ -547,6 +549,8 @@ export class QRMeshChatElement extends HTMLElement {
           this.renderMessages();
           // Update QR to show next pending message (or beacon if done)
           this.updateQR();
+        } else {
+          console.log('[Chat] No matching message found for pn:', event.pn, 'queue:', this.messageQueue.map(m => m.pn));
         }
         this.updateDeliveryStatus();
         break;
@@ -625,12 +629,12 @@ export class QRMeshChatElement extends HTMLElement {
       await this.displayCurrentChunk();
       this.mesh.markPacketDisplayed(packet);
 
-      // If multiple chunks, cycle through them
+      // If multiple chunks, cycle through them faster for reliable scanning
       if (this.currentChunks.length > 1) {
         this.chunkCycleInterval = setInterval(async () => {
           this.currentChunkIndex = (this.currentChunkIndex + 1) % this.currentChunks.length;
           await this.displayCurrentChunk();
-        }, 300); // Cycle every 300ms
+        }, 150); // Cycle every 150ms - faster for more scan opportunities
       }
     }
   }
@@ -712,13 +716,15 @@ export class QRMeshChatElement extends HTMLElement {
 
     // Check if this is a chunk that needs assembly
     if (isChunk(data)) {
-      console.log('[Chat] Received chunk:', data);
+      const chunkInfo = data.slice(0, 4); // F + stream + index + flag
+      const isLast = data[3] === 'L';
+      console.log(`[Chat] Chunk: ${chunkInfo} (${isLast ? 'LAST' : 'more...'})`);
       const assembled = this.chunkAssembler.addChunk(data);
       if (assembled) {
-        console.log('[Chat] Chunks assembled into:', assembled);
+        console.log('[Chat] ASSEMBLED:', assembled);
         data = assembled;
       } else {
-        // Still waiting for more chunks
+        // Still waiting for more chunks - flash to show we're receiving
         this.flashScanIndicator();
         return;
       }
