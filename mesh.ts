@@ -357,11 +357,28 @@ export class MeshState {
 
       case PACKET_TYPES.DATA:
         await this.handleData(peer, packet);
+        // Queue ACK response so sender knows we received it
+        this.queueAck(peer);
         break;
 
       case PACKET_TYPES.ACK:
         // Already processed above
         break;
+    }
+  }
+
+  /**
+   * Queue an ACK packet to be displayed
+   */
+  private queueAck(peer: Peer): void {
+    // Check if we already have a pending ACK for this peer
+    const hasAck = Array.from(peer.sentPackets.values())
+      .some(s => s.packet.t === PACKET_TYPES.ACK && s.status === 'pending');
+
+    if (!hasAck && peer.receivedPns.length > 0) {
+      const pn = this.getNextPn();
+      const ackPacket = createAckPacket(this.deviceId, peer.id, pn, peer.receivedPns);
+      this.trackSentPacket(peer, ackPacket);
     }
   }
 

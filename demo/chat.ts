@@ -548,6 +548,8 @@ export class QRMeshChatElement extends HTMLElement {
             timestamp: event.message.timestamp,
           });
           this.renderMessages();
+          // Update QR to show ACK packet
+          this.updateQR();
         }
         break;
     }
