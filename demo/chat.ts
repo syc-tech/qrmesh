@@ -616,9 +616,28 @@ export class QRMeshChatElement extends HTMLElement {
       await this.scanner.start(this.videoEl);
       this.hideCameraOverlay();
       this.updateStatus('Scanning', 'scanning');
+
+      // Update scan debug display every 500ms
+      this.startScanDebugUpdates();
     } catch (e) {
       this.updateCameraOverlay((e as Error).message, true);
     }
+  }
+
+  private scanDebugInterval: ReturnType<typeof setInterval> | null = null;
+
+  private startScanDebugUpdates() {
+    if (this.scanDebugInterval) return;
+
+    const scanCountEl = this.shadow.getElementById('scan-count');
+    const scanResultEl = this.shadow.getElementById('scan-result');
+
+    this.scanDebugInterval = setInterval(() => {
+      if (this.scanner) {
+        if (scanCountEl) scanCountEl.textContent = String(this.scanner.scanCount);
+        if (scanResultEl) scanResultEl.textContent = this.scanner.lastScanResult;
+      }
+    }, 500);
   }
 
   private handleScan(data: string) {
@@ -872,6 +891,10 @@ export class QRMeshChatElement extends HTMLElement {
               <div class="camera-overlay" id="camera-overlay">
                 <p>Click "Start Camera" to begin scanning</p>
               </div>
+            </div>
+            <div class="scan-debug" id="scan-debug" style="font-size: 0.7rem; color: #64748b; padding: 0.25rem 0.5rem; background: #1e293b; border-radius: 0 0 0.5rem 0.5rem;">
+              Scans: <span id="scan-count">0</span> |
+              Last: <span id="scan-result">waiting...</span>
             </div>
           </div>
         </div>
