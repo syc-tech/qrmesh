@@ -512,8 +512,12 @@ export class QRMeshChatElement extends HTMLElement {
   private handleMeshEvent(event: MeshEvent) {
     switch (event.type) {
       case 'peer_discovered':
+        // Auto-select first discovered peer
+        if (!this.activePeerId) {
+          this.activePeerId = event.peer.id;
+        }
         this.updatePeerBadge(event.peer.id, 'discovered');
-        this.updateStatus('Peer found!', 'connected');
+        this.updateStatus('Peer found: ' + event.peer.id.slice(0, 4) + '...', 'connected');
         break;
       case 'peer_updated':
         this.updatePeerBadge(event.peer.id, 'discovered');
