@@ -5,7 +5,7 @@
  * full public keys when actually communicating.
  */
 
-import { KeyPair, deriveSharedKey, encrypt, decrypt } from './crypto';
+import { KeyPair, deriveSharedKey, decrypt } from './crypto';
 import {
   QRPacket,
   AckRange,
@@ -189,15 +189,6 @@ export class MeshState {
     const packets: QRPacket[] = [];
     const now = Date.now();
 
-    // Debug: log all peers and their sent packets
-    console.log('[MESH] getOutgoingPackets - peers:', this.peers.size);
-    for (const [id, peer] of this.peers) {
-      console.log('[MESH]   Peer', id, 'sentPackets:', peer.sentPackets.size);
-      for (const [pn, sent] of peer.sentPackets) {
-        console.log('[MESH]     pn:', pn, 'type:', sent.packet.t, 'status:', sent.status, 'age:', now - sent.timestamp);
-      }
-    }
-
     // Priority 1: Packets needing retransmission
     for (const peer of this.peers.values()) {
       for (const [, sent] of peer.sentPackets) {
@@ -248,7 +239,7 @@ export class MeshState {
   }
 
   /**
-   * Send chat - will send INITIAL first if no key exchange yet
+   * Send chat - sends plaintext for now (encryption disabled for QR size)
    */
   async sendChat(peerId: string, text: string): Promise<number> {
     let peer = this.peers.get(peerId);
@@ -261,28 +252,8 @@ export class MeshState {
     const pn = this.getNextPn();
     const acks = peer.receivedPns.length > 0 ? peer.receivedPns : undefined;
 
-    // If no shared key yet, send INITIAL first
-    if (!peer.sharedKey) {
-      const initialPn = this.getNextPn();
-      const initialPacket = createInitialPacket(
-        this.deviceId,
-        peerId,
-        initialPn,
-        this.publicKey,
-        this.deviceName,
-        acks
-      );
-      this.trackSentPacket(peer, initialPacket);
-      this.emit({ type: 'packet_sent', packet: initialPacket });
-    }
-
-    let payload: ChatPayload;
-    if (peer.sharedKey) {
-      const { ciphertext, iv } = await encrypt(peer.sharedKey, text);
-      payload = { e: true, c: ciphertext, i: iv };
-    } else {
-      payload = { e: false, p: text };
-    }
+    // Send plaintext for now - encryption makes QR too dense
+    const payload: ChatPayload = { p: text };
 
     const packet = createChatPacket(this.deviceId, peerId, pn, payload, acks);
     this.trackSentPacket(peer, packet);
@@ -403,8 +374,6 @@ export class MeshState {
     if (packet.t !== PACKET_TYPES.BEACON) return;
 
     let peer = this.peers.get(packet.src);
-    const isNew = !peer;
-
     if (!peer) {
       // Create peer without key - will get key on INITIAL
       peer = this.createPeer(packet.src, undefined, packet.name);
@@ -415,27 +384,8 @@ export class MeshState {
       this.emit({ type: 'peer_updated', peer });
     }
 
-    // Auto-send INITIAL to start key exchange (only if we haven't already)
-    if (isNew || !peer.sharedKey) {
-      const existingInitial = Array.from(peer.sentPackets.values())
-        .some(s => s.packet.t === PACKET_TYPES.INITIAL);
-
-      console.log('[MESH] Checking INITIAL:', { isNew, hasKey: !!peer.sharedKey, existingInitial, sentPacketsCount: peer.sentPackets.size });
-
-      if (!existingInitial) {
-        const pn = this.getNextPn();
-        const initialPacket = createInitialPacket(
-          this.deviceId,
-          peer.id,
-          pn,
-          this.publicKey,
-          this.deviceName
-        );
-        console.log('[MESH] Queueing INITIAL packet to', peer.id, 'pn:', pn);
-        this.trackSentPacket(peer, initialPacket);
-        console.log('[MESH] After tracking, sentPackets:', peer.sentPackets.size);
-      }
-    }
+    // Don't auto-send INITIAL - it's too large for reliable QR scanning
+    // Key exchange will happen when first message is sent (if needed)
   }
 
   markPacketDisplayed(packet: QRPacket): void {

@@ -510,23 +510,13 @@ export class QRMeshChatElement extends HTMLElement {
   }
 
   private handleMeshEvent(event: MeshEvent) {
-    console.log('[MESH EVENT]', event.type, event);
-
     switch (event.type) {
       case 'peer_discovered':
-        console.log('[MESH] Peer discovered:', event.peer.id);
         this.updatePeerBadge(event.peer.id, 'discovered');
-        this.updateQR(); // Update QR to send INITIAL
+        this.updateStatus('Peer found!', 'connected');
         break;
       case 'peer_updated':
-        console.log('[MESH] Peer updated:', event.peer.id, 'hasKey:', !!event.peer.sharedKey);
-        if (event.peer.sharedKey) {
-          this.activePeerId = event.peer.id;
-          this.updatePeerBadge(event.peer.id, 'active');
-          this.updateStatus('Connected (0-RTT)', 'connected');
-          this.processMessageQueue();
-        }
-        this.updateQR(); // Update QR to respond
+        this.updatePeerBadge(event.peer.id, 'discovered');
         break;
       case 'packet_acked':
         // Update message status
@@ -577,30 +567,27 @@ export class QRMeshChatElement extends HTMLElement {
         this.renderMessages();
       }
     }
+
+    // Update QR to show outgoing message
+    this.updateQR();
   }
 
   private async updateQR() {
     if (!this.mesh || !this.qrCanvas) return;
 
     const packet = this.mesh.getNextOutgoingPacket();
-    console.log('[QR] Next outgoing packet:', packet?.t, 'to:', packet?.dst, 'encoded:', packet ? encodePacket(packet) : 'none');
-
     if (packet) {
       const encoded = encodePacket(packet);
 
       // Only redraw if packet changed
-      if (encoded === this.lastDisplayedPacket) {
-        console.log('[QR] Skipping - same as last displayed');
-        return;
-      }
+      if (encoded === this.lastDisplayedPacket) return;
       this.lastDisplayedPacket = encoded;
-      console.log('[QR] Rendering new QR:', encoded.slice(0, 50) + (encoded.length > 50 ? '...' : ''));
 
       try {
         await QRCode.toCanvas(this.qrCanvas, encoded, {
-          width: 500,           // Larger for old cameras
-          margin: 4,            // Bigger quiet zone helps detection
-          errorCorrectionLevel: 'M',  // Better error correction for blur
+          width: 500,
+          margin: 4,
+          errorCorrectionLevel: 'M',
           color: { dark: '#000', light: '#fff' },
         });
         this.mesh.markPacketDisplayed(packet);
@@ -635,34 +622,23 @@ export class QRMeshChatElement extends HTMLElement {
   private handleScan(data: string) {
     if (!this.mesh) return;
 
-    console.log('[SCAN] Raw data:', data);
-
     const packet = decodePacket(data);
-    if (!packet) {
-      console.log('[SCAN] Failed to decode packet');
-      return;
-    }
-
-    console.log('[SCAN] Decoded packet:', packet.t, 'from:', packet.src);
+    if (!packet) return;
 
     // Flash the status to indicate scan
     this.flashScanIndicator();
 
     if (packet.t === PACKET_TYPES.BEACON) {
-      console.log('[SCAN] Processing beacon from:', packet.src);
       this.mesh.processBeacon(packet);
       // Auto-select peer when discovered
       const peers = this.mesh.getPeers();
-      console.log('[SCAN] Peers after beacon:', peers.length);
       if (peers.length > 0 && !this.activePeerId) {
         this.activePeerId = peers[0].id;
         this.updatePeerBadge(peers[0].id, peers[0].sharedKey ? 'active' : 'discovered');
       }
     } else {
-      console.log('[SCAN] Processing packet type:', packet.t);
       this.mesh.processPacket(packet);
     }
-    // Don't update QR here - keep beacon static
   }
 
   private flashScanIndicator() {

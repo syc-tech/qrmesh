@@ -84,7 +84,6 @@ export class QRScanner {
 
       // Start scanning loop
       this.running = true;
-      console.log('[SCANNER] v2 Started, video size:', this.video.videoWidth, 'x', this.video.videoHeight);
       this.intervalId = setInterval(() => this.scan(), this.scanInterval);
     } catch (error) {
       this.onError?.(error as Error);
@@ -124,32 +123,13 @@ export class QRScanner {
     return this.running;
   }
 
-  private scanCount = 0;
-
   /**
    * Perform a single scan
    */
   private scan(): void {
-    this.scanCount++;
 
-    // Log every 50 scans
-    if (this.scanCount % 50 === 1) {
-      console.log('[SCANNER] Scan #' + this.scanCount,
-        'video:', !!this.video,
-        'canvas:', !!this.canvas,
-        'ctx:', !!this.ctx,
-        'readyState:', this.video?.readyState,
-        'HAVE_ENOUGH_DATA:', this.video?.HAVE_ENOUGH_DATA);
-    }
-
-    if (!this.video || !this.canvas || !this.ctx) {
-      if (this.scanCount % 50 === 1) console.log('[SCANNER] Early return: missing video/canvas/ctx');
-      return;
-    }
-    if (this.video.readyState !== this.video.HAVE_ENOUGH_DATA) {
-      if (this.scanCount % 50 === 1) console.log('[SCANNER] Early return: video not ready');
-      return;
-    }
+    if (!this.video || !this.canvas || !this.ctx) return;
+    if (this.video.readyState !== this.video.HAVE_ENOUGH_DATA) return;
 
     // Update canvas size if video size changed
     if (
@@ -171,36 +151,12 @@ export class QRScanner {
       this.canvas.height
     );
 
-    // Log image data stats occasionally
-    if (this.scanCount % 50 === 1) {
-      // Analyze image brightness to see if QR might be visible
-      let minBrightness = 255, maxBrightness = 0;
-      for (let i = 0; i < imageData.data.length; i += 400) { // Sample every 100th pixel
-        const r = imageData.data[i];
-        const g = imageData.data[i + 1];
-        const b = imageData.data[i + 2];
-        const brightness = (r + g + b) / 3;
-        minBrightness = Math.min(minBrightness, brightness);
-        maxBrightness = Math.max(maxBrightness, brightness);
-      }
-      console.log('[SCANNER] Image:', imageData.width, 'x', imageData.height,
-        'brightness range:', Math.round(minBrightness), '-', Math.round(maxBrightness),
-        '(need 0-255 range for QR)');
-    }
-
     // Attempt to decode QR code
-    if (this.scanCount % 50 === 1) {
-      console.log('[SCANNER] Calling jsQR...');
-    }
     const code = jsQR(imageData.data, imageData.width, imageData.height, {
-      inversionAttempts: 'attemptBoth',  // Try both normal and inverted
+      inversionAttempts: 'attemptBoth',
     });
-    if (this.scanCount % 50 === 1) {
-      console.log('[SCANNER] jsQR result:', code ? 'FOUND: ' + code.data : 'null');
-    }
 
     if (code && code.data) {
-      console.log('[SCANNER] Found QR code:', code.data);
       const now = Date.now();
 
       // Debounce: don't report same QR code repeatedly
@@ -210,7 +166,6 @@ export class QRScanner {
       ) {
         this.lastScannedData = code.data;
         this.lastScanTime = now;
-        console.log('[SCANNER] Reporting scan (not debounced)');
 
         this.onScan({
           data: code.data,
