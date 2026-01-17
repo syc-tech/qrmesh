@@ -1053,17 +1053,6 @@ export class QRMeshChatElement extends HTMLElement {
         }
       }
     });
-
-
-    peerIdInput?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        const peerId = peerIdInput.value.trim().toUpperCase();
-        if (peerId && peerId.length === 8 && /^[0-9A-F]+$/.test(peerId)) {
-          this.manualConnect(peerId);
-          peerIdInput.value = '';
-        }
-      }
-    });
   }
 
   private manualConnect(peerId: string) {
