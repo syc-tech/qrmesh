@@ -839,6 +839,13 @@ export class QRMeshChatElement extends HTMLElement {
           </div>
         </div>
 
+        <div class="manual-connect" style="margin: 0.5rem 0; display: flex; gap: 0.5rem; align-items: center;">
+          <input type="text" id="peer-id-input" placeholder="Enter peer ID (8 chars)"
+                 style="flex:1; padding:0.4rem; border-radius:0.25rem; border:1px solid #334155; background:#1e293b; color:#e2e8f0; font-family:monospace; text-transform:uppercase;"
+                 maxlength="8" />
+          <button id="manual-connect-btn" class="secondary" style="padding:0.4rem 0.75rem;">Connect</button>
+        </div>
+
         <div class="panels">
           <div class="panel">
             <div class="panel-header">
@@ -938,6 +945,38 @@ export class QRMeshChatElement extends HTMLElement {
         }
       }
     });
+
+    // Manual connect
+    const peerIdInput = this.shadow.getElementById('peer-id-input') as HTMLInputElement;
+    this.shadow.getElementById('manual-connect-btn')?.addEventListener('click', () => {
+      const peerId = peerIdInput?.value.trim().toUpperCase();
+      if (peerId && peerId.length === 8 && /^[0-9A-F]+$/.test(peerId)) {
+        this.manualConnect(peerId);
+        peerIdInput.value = '';
+      } else {
+        this.updateStatus('Invalid ID (need 8 hex chars)', 'error');
+      }
+    });
+
+    peerIdInput?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        const peerId = peerIdInput.value.trim().toUpperCase();
+        if (peerId && peerId.length === 8 && /^[0-9A-F]+$/.test(peerId)) {
+          this.manualConnect(peerId);
+          peerIdInput.value = '';
+        }
+      }
+    });
+  }
+
+  private manualConnect(peerId: string) {
+    if (!this.mesh) return;
+    // Create a fake beacon packet to discover the peer
+    const fakeBeacon = { t: 'B' as const, src: peerId, dst: '*', pn: 0, v: 3 };
+    this.mesh.processBeacon(fakeBeacon as any);
+    this.activePeerId = peerId;
+    this.updatePeerBadge(peerId, 'discovered');
+    this.updateStatus('Connected to ' + peerId, 'connected');
   }
 }
 
