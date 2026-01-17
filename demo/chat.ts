@@ -564,15 +564,25 @@ export class QRMeshChatElement extends HTMLElement {
   }
 
   private async processMessageQueue() {
+    console.log('[Chat] processMessageQueue called', {
+      hasMesh: !!this.mesh,
+      activePeerId: this.activePeerId,
+      queueLength: this.messageQueue.length,
+      queuedMsgs: this.messageQueue.filter(m => m.status === 'queued').length
+    });
+
     if (!this.mesh || !this.activePeerId) return;
 
     const peer = this.mesh.getPeer(this.activePeerId);
+    console.log('[Chat] peer lookup:', peer ? 'found' : 'NOT FOUND');
     if (!peer) return;
 
     for (const msg of this.messageQueue) {
       if (msg.status === 'queued') {
+        console.log('[Chat] Sending message:', msg.text);
         msg.status = 'pending';
         const pn = await this.mesh.sendChat(this.activePeerId, msg.text);
+        console.log('[Chat] Message sent with pn:', pn);
         msg.pn = pn;
         this.renderMessages();
       }
