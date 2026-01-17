@@ -9,13 +9,11 @@ import { KeyPair, deriveSharedKey, decrypt } from './crypto';
 import {
   QRPacket,
   AckRange,
-  ChatPayload,
   OfferPayload,
   createBeaconPacket,
   createInitialPacket,
   createDataPacket,
   createAckPacket,
-  createChatPacket,
   parseChatPayload,
   isForUs,
   addToAckRanges,
@@ -252,10 +250,8 @@ export class MeshState {
     const pn = this.getNextPn();
     const acks = peer.receivedPns.length > 0 ? peer.receivedPns : undefined;
 
-    // Send plaintext for now - encryption makes QR too dense
-    const payload: ChatPayload = { p: text };
-
-    const packet = createChatPacket(this.deviceId, peerId, pn, payload, acks);
+    // Send raw text as payload (no JSON wrapper) for minimal QR size
+    const packet = createDataPacket(this.deviceId, peerId, pn, MESSAGE_TYPES.CHAT, text, acks);
     this.trackSentPacket(peer, packet);
     this.emit({ type: 'packet_sent', packet });
 
@@ -264,7 +260,7 @@ export class MeshState {
       direction: 'sent',
       text,
       timestamp: Date.now(),
-      encrypted: !!peer.sharedKey,
+      encrypted: false,
       pn,
     };
     this.chatHistory.push(message);
@@ -356,9 +352,9 @@ export class MeshState {
         break;
 
       case PACKET_TYPES.DATA:
-        await this.handleData(peer, packet);
-        // Queue ACK response so sender knows we received it
+        // Queue ACK first, so updateQR will see it when chat_message is emitted
         this.queueAck(peer);
+        await this.handleData(peer, packet);
         break;
 
       case PACKET_TYPES.ACK:
@@ -491,21 +487,28 @@ export class MeshState {
   }
 
   private async handleChat(peer: Peer, packet: QRPacket): Promise<void> {
-    const payload = parseChatPayload(packet);
-    if (!payload) return;
+    if (!packet.payload) return;
 
     let text: string;
-    if (payload.e && payload.c && payload.i && peer.sharedKey) {
-      try {
-        text = await decrypt(peer.sharedKey, payload.c, payload.i);
-      } catch (e) {
-        console.error('Decrypt failed:', e);
-        text = '[Decryption failed]';
+
+    // Try to parse as JSON (old format), otherwise treat as raw text (new compact format)
+    const payload = parseChatPayload(packet);
+    if (payload) {
+      if (payload.e && payload.c && payload.i && peer.sharedKey) {
+        try {
+          text = await decrypt(peer.sharedKey, payload.c, payload.i);
+        } catch (e) {
+          console.error('Decrypt failed:', e);
+          text = '[Decryption failed]';
+        }
+      } else if (payload.p) {
+        text = payload.p;
+      } else {
+        text = '[Invalid message]';
       }
-    } else if (payload.p) {
-      text = payload.p;
     } else {
-      text = '[Invalid message]';
+      // Raw text payload (compact format)
+      text = packet.payload;
     }
 
     const message: ChatMessage = {
@@ -513,7 +516,7 @@ export class MeshState {
       direction: 'received',
       text,
       timestamp: Date.now(),
-      encrypted: !!payload.e,
+      encrypted: !!(payload && payload.e),
       pn: packet.pn,
     };
 

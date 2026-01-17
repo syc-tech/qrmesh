@@ -10,14 +10,22 @@ import jsQR from 'jsqr';
 // Check for native BarcodeDetector support
 const hasBarcodeDetector = typeof (window as any).BarcodeDetector !== 'undefined';
 let barcodeDetector: any = null;
+let scannerMode = 'jsQR';
 
 if (hasBarcodeDetector) {
   try {
     barcodeDetector = new (window as any).BarcodeDetector({ formats: ['qr_code'] });
+    scannerMode = 'BarcodeDetector';
     console.log('[Scanner] Using native BarcodeDetector (hardware-accelerated)');
   } catch (e) {
     console.log('[Scanner] BarcodeDetector init failed, using jsQR fallback');
   }
+} else {
+  console.log('[Scanner] BarcodeDetector not available, using jsQR');
+}
+
+export function getScannerMode(): string {
+  return scannerMode;
 }
 
 export interface ScanResult {
@@ -54,6 +62,10 @@ export class QRScanner {
   private lastScanTime: number = 0;
   private debounceMs: number;
   private running: boolean = false;
+
+  // Debug stats
+  public scanCount: number = 0;
+  public lastScanResult: string = 'none';
 
   constructor(options: QRScannerOptions) {
     this.onScan = options.onScan;
@@ -143,6 +155,7 @@ export class QRScanner {
     if (!this.video || !this.canvas || !this.ctx) return;
     if (this.video.readyState !== this.video.HAVE_ENOUGH_DATA) return;
 
+    this.scanCount++;
     let data: string | null = null;
 
     // Try native BarcodeDetector first (much more reliable)
@@ -187,6 +200,8 @@ export class QRScanner {
         data = code.data;
       }
     }
+
+    this.lastScanResult = data ? `FOUND: ${data.slice(0, 20)}` : 'no QR detected';
 
     if (data) {
       const now = Date.now();
