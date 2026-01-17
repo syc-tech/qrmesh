@@ -518,8 +518,10 @@ export class QRMeshChatElement extends HTMLElement {
   }
 
   private handleMeshEvent(event: MeshEvent) {
+    console.log('[Chat] Mesh event:', event.type);
     switch (event.type) {
       case 'peer_discovered':
+        console.log('[Chat] peer_discovered! Peer:', event.peer.id, 'activePeerId before:', this.activePeerId);
         // Auto-select first discovered peer
         if (!this.activePeerId) {
           this.activePeerId = event.peer.id;
@@ -527,6 +529,7 @@ export class QRMeshChatElement extends HTMLElement {
         this.updatePeerBadge(event.peer.id, 'discovered');
         this.updateStatus('Peer found: ' + event.peer.id.slice(0, 4) + '...', 'connected');
         // Send any queued messages now that we have a peer
+        console.log('[Chat] Calling processMessageQueue from peer_discovered');
         this.processMessageQueue();
         break;
       case 'peer_updated':
