@@ -667,23 +667,31 @@ export class QRMeshChatElement extends HTMLElement {
   }
 
   private handleScan(data: string) {
+    console.log('[Chat] handleScan raw:', data);
     if (!this.mesh) return;
 
     const packet = decodePacket(data);
-    if (!packet) return;
+    console.log('[Chat] decoded packet:', packet);
+    if (!packet) {
+      console.log('[Chat] Failed to decode packet');
+      return;
+    }
 
     // Flash the status to indicate scan
     this.flashScanIndicator();
 
     if (packet.t === PACKET_TYPES.BEACON) {
+      console.log('[Chat] Processing beacon from:', packet.src);
       this.mesh.processBeacon(packet);
       // Auto-select peer when discovered
       const peers = this.mesh.getPeers();
+      console.log('[Chat] Peers after beacon:', peers.length, 'activePeerId:', this.activePeerId);
       if (peers.length > 0 && !this.activePeerId) {
         this.activePeerId = peers[0].id;
         this.updatePeerBadge(peers[0].id, peers[0].sharedKey ? 'active' : 'discovered');
       }
     } else {
+      console.log('[Chat] Processing non-beacon packet type:', packet.t);
       this.mesh.processPacket(packet);
     }
   }
@@ -886,13 +894,6 @@ export class QRMeshChatElement extends HTMLElement {
           </div>
         </div>
 
-        <div class="manual-connect" style="margin: 0.5rem 0; display: flex; gap: 0.5rem; align-items: center;">
-          <input type="text" id="peer-id-input" placeholder="Enter peer ID (8 chars)"
-                 style="flex:1; padding:0.4rem; border-radius:0.25rem; border:1px solid #334155; background:#1e293b; color:#e2e8f0; font-family:monospace; text-transform:uppercase;"
-                 maxlength="8" />
-          <button id="manual-connect-btn" class="secondary" style="padding:0.4rem 0.75rem;">Connect</button>
-        </div>
-
         <div class="panels">
           <div class="panel">
             <div class="panel-header">
@@ -999,17 +1000,6 @@ export class QRMeshChatElement extends HTMLElement {
       }
     });
 
-    // Manual connect
-    const peerIdInput = this.shadow.getElementById('peer-id-input') as HTMLInputElement;
-    this.shadow.getElementById('manual-connect-btn')?.addEventListener('click', () => {
-      const peerId = peerIdInput?.value.trim().toUpperCase();
-      if (peerId && peerId.length === 8 && /^[0-9A-F]+$/.test(peerId)) {
-        this.manualConnect(peerId);
-        peerIdInput.value = '';
-      } else {
-        this.updateStatus('Invalid ID (need 8 hex chars)', 'error');
-      }
-    });
 
     peerIdInput?.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
