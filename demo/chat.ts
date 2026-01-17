@@ -518,6 +518,8 @@ export class QRMeshChatElement extends HTMLElement {
         }
         this.updatePeerBadge(event.peer.id, 'discovered');
         this.updateStatus('Peer found: ' + event.peer.id.slice(0, 4) + '...', 'connected');
+        // Send any queued messages now that we have a peer
+        this.processMessageQueue();
         break;
       case 'peer_updated':
         this.updatePeerBadge(event.peer.id, 'discovered');
@@ -595,10 +597,14 @@ export class QRMeshChatElement extends HTMLElement {
         await QRCode.toCanvas(this.qrCanvas, encoded, {
           width: 500,
           margin: 4,
-          errorCorrectionLevel: 'M',
+          errorCorrectionLevel: 'L',
           color: { dark: '#000', light: '#fff' },
         });
         this.mesh.markPacketDisplayed(packet);
+
+        // Update debug display
+        const qrDebug = this.shadow.getElementById('qr-debug');
+        if (qrDebug) qrDebug.textContent = `QR: ${encoded} (${encoded.length} chars)`;
       } catch (e) {
         console.error('QR error:', e);
       }
@@ -885,6 +891,7 @@ export class QRMeshChatElement extends HTMLElement {
             <div class="qr-area">
               <canvas id="qr-canvas" width="280" height="280"></canvas>
             </div>
+            <div id="qr-debug" style="font-size: 0.65rem; color: #64748b; padding: 0.25rem; word-break: break-all; max-width: 280px; text-align: center;">QR: ...</div>
             <div class="status-bar">
               <span class="status-dot" id="status-dot"></span>
               <span id="status-text">Initializing...</span>

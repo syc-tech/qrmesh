@@ -420,6 +420,13 @@ export class MeshState {
     if (sent && sent.status === 'pending') {
       sent.timestamp = Date.now();
       sent.retries++;
+
+      // ACK packets don't get acknowledged themselves, so mark them as 'acked'
+      // after first display so they don't block the queue
+      if (packet.t === PACKET_TYPES.ACK) {
+        sent.status = 'acked';
+        console.log(`[Mesh] ACK packet ${packet.pn} marked as acked after display`);
+      }
     }
   }
 
