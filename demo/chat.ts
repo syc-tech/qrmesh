@@ -7,7 +7,7 @@
 
 import QRCode from 'qrcode';
 import { getOrCreateKeyPair, type KeyPair, type KeyStorage } from '../crypto';
-import { encodePacket, decodePacket, PACKET_TYPES } from '../protocol';
+import { encodePacket, decodePacket, PACKET_TYPES, chunkPacket, isChunk, ChunkAssembler } from '../protocol';
 import { QRScanner, getScannerMode } from '../scanner';
 import { MeshState, type MeshEvent } from '../mesh';
 
@@ -455,6 +455,13 @@ export class QRMeshChatElement extends HTMLElement {
   private lastDisplayedPacket: string | null = null;
   private scanFlashTimeout: ReturnType<typeof setTimeout> | null = null;
 
+  // Chunking state
+  private chunkAssembler = new ChunkAssembler();
+  private currentChunks: string[] = [];
+  private currentChunkIndex: number = 0;
+  private chunkCycleInterval: ReturnType<typeof setInterval> | null = null;
+  private streamIdCounter: number = 0;
+
   // DOM refs
   private qrCanvas: HTMLCanvasElement | null = null;
   private videoEl: HTMLVideoElement | null = null;
@@ -480,6 +487,7 @@ export class QRMeshChatElement extends HTMLElement {
 
   disconnectedCallback() {
     if (this.scanFlashTimeout) clearTimeout(this.scanFlashTimeout);
+    if (this.chunkCycleInterval) clearInterval(this.chunkCycleInterval);
     this.scanner?.stop();
   }
 
@@ -599,25 +607,57 @@ export class QRMeshChatElement extends HTMLElement {
     if (packet) {
       const encoded = encodePacket(packet);
 
-      // Only redraw if packet changed
+      // Only update if packet changed
       if (encoded === this.lastDisplayedPacket) return;
       this.lastDisplayedPacket = encoded;
 
-      try {
-        await QRCode.toCanvas(this.qrCanvas, encoded, {
-          width: 500,
-          margin: 4,
-          errorCorrectionLevel: 'L',
-          color: { dark: '#000', light: '#fff' },
-        });
-        this.mesh.markPacketDisplayed(packet);
+      // Chunk the packet (returns single-element array if <= 8 chars)
+      this.currentChunks = chunkPacket(encoded, this.streamIdCounter++);
+      this.currentChunkIndex = 0;
 
-        // Update debug display
-        const qrDebug = this.shadow.getElementById('qr-debug');
-        if (qrDebug) qrDebug.textContent = `QR: ${encoded} (${encoded.length} chars)`;
-      } catch (e) {
-        console.error('QR error:', e);
+      // Stop existing cycle
+      if (this.chunkCycleInterval) {
+        clearInterval(this.chunkCycleInterval);
+        this.chunkCycleInterval = null;
       }
+
+      // Display first chunk
+      await this.displayCurrentChunk();
+      this.mesh.markPacketDisplayed(packet);
+
+      // If multiple chunks, cycle through them
+      if (this.currentChunks.length > 1) {
+        this.chunkCycleInterval = setInterval(async () => {
+          this.currentChunkIndex = (this.currentChunkIndex + 1) % this.currentChunks.length;
+          await this.displayCurrentChunk();
+        }, 300); // Cycle every 300ms
+      }
+    }
+  }
+
+  private async displayCurrentChunk() {
+    if (!this.qrCanvas || this.currentChunks.length === 0) return;
+
+    const chunk = this.currentChunks[this.currentChunkIndex];
+    try {
+      await QRCode.toCanvas(this.qrCanvas, chunk, {
+        width: 500,
+        margin: 4,
+        errorCorrectionLevel: 'L',
+        color: { dark: '#000', light: '#fff' },
+      });
+
+      // Update debug display
+      const qrDebug = this.shadow.getElementById('qr-debug');
+      if (qrDebug) {
+        if (this.currentChunks.length > 1) {
+          qrDebug.textContent = `Chunk ${this.currentChunkIndex + 1}/${this.currentChunks.length}: ${chunk}`;
+        } else {
+          qrDebug.textContent = `QR: ${chunk} (${chunk.length} chars)`;
+        }
+      }
+    } catch (e) {
+      console.error('QR error:', e);
     }
   }
 
@@ -669,6 +709,20 @@ export class QRMeshChatElement extends HTMLElement {
   private handleScan(data: string) {
     console.log('[Chat] handleScan raw:', data);
     if (!this.mesh) return;
+
+    // Check if this is a chunk that needs assembly
+    if (isChunk(data)) {
+      console.log('[Chat] Received chunk:', data);
+      const assembled = this.chunkAssembler.addChunk(data);
+      if (assembled) {
+        console.log('[Chat] Chunks assembled into:', assembled);
+        data = assembled;
+      } else {
+        // Still waiting for more chunks
+        this.flashScanIndicator();
+        return;
+      }
+    }
 
     const packet = decodePacket(data);
     console.log('[Chat] decoded packet:', packet);

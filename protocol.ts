@@ -393,3 +393,141 @@ export function parseChatPayload(packet: QRPacket): ChatPayload | null {
     return null;
   }
 }
+
+// ============================================================
+// CHUNKING - Split large packets into 8-char chunks for reliable QR scanning
+// ============================================================
+
+const MAX_CHUNK_SIZE = 8;
+const CHUNK_DATA_SIZE = 4; // F + stream + index + flags + 4 data chars = 8
+
+/**
+ * Encode a number to base36 char (0-9, A-Z)
+ */
+function toBase36(n: number): string {
+  if (n < 10) return String(n);
+  return String.fromCharCode(55 + n); // A=65, so 10 -> 'A'
+}
+
+/**
+ * Decode base36 char to number
+ */
+function fromBase36(c: string): number {
+  const code = c.charCodeAt(0);
+  if (code >= 48 && code <= 57) return code - 48; // 0-9
+  if (code >= 65 && code <= 90) return code - 55; // A-Z
+  return 0;
+}
+
+/**
+ * Split an encoded packet into 8-char chunks
+ * Returns array of chunk strings, or just the original if <= 8 chars
+ */
+export function chunkPacket(encoded: string, streamId: number = 0): string[] {
+  // If already 8 chars or less, return as-is (beacon format)
+  if (encoded.length <= MAX_CHUNK_SIZE) {
+    return [encoded];
+  }
+
+  const chunks: string[] = [];
+  const totalChunks = Math.ceil(encoded.length / CHUNK_DATA_SIZE);
+  const streamChar = toBase36(streamId % 36);
+
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * CHUNK_DATA_SIZE;
+    const data = encoded.slice(start, start + CHUNK_DATA_SIZE).padEnd(CHUNK_DATA_SIZE, ' ');
+    const isLast = i === totalChunks - 1;
+    const indexChar = toBase36(i);
+    const flagChar = isLast ? 'L' : 'M'; // L=last, M=more
+
+    chunks.push(`F${streamChar}${indexChar}${flagChar}${data}`);
+  }
+
+  return chunks;
+}
+
+/**
+ * Check if a string is a chunk (starts with 'F')
+ */
+export function isChunk(data: string): boolean {
+  return data.length === 8 && data[0] === 'F';
+}
+
+/**
+ * Parse chunk metadata
+ */
+export function parseChunk(data: string): { streamId: number; index: number; isLast: boolean; data: string } | null {
+  if (!isChunk(data)) return null;
+  return {
+    streamId: fromBase36(data[1]),
+    index: fromBase36(data[2]),
+    isLast: data[3] === 'L',
+    data: data.slice(4).trimEnd(),
+  };
+}
+
+/**
+ * Chunk assembler - collects chunks and reassembles packets
+ */
+export class ChunkAssembler {
+  private streams: Map<number, Map<number, string>> = new Map();
+  private streamComplete: Map<number, number> = new Map(); // streamId -> lastIndex
+
+  /**
+   * Add a chunk. Returns assembled packet if complete, null otherwise.
+   */
+  addChunk(data: string): string | null {
+    const chunk = parseChunk(data);
+    if (!chunk) return null;
+
+    // Get or create stream buffer
+    let stream = this.streams.get(chunk.streamId);
+    if (!stream) {
+      stream = new Map();
+      this.streams.set(chunk.streamId, stream);
+    }
+
+    // Store chunk data
+    stream.set(chunk.index, chunk.data);
+
+    // Track if this is the last chunk
+    if (chunk.isLast) {
+      this.streamComplete.set(chunk.streamId, chunk.index);
+    }
+
+    // Check if stream is complete
+    const lastIndex = this.streamComplete.get(chunk.streamId);
+    if (lastIndex !== undefined) {
+      // Check if we have all chunks 0..lastIndex
+      let complete = true;
+      for (let i = 0; i <= lastIndex; i++) {
+        if (!stream.has(i)) {
+          complete = false;
+          break;
+        }
+      }
+
+      if (complete) {
+        // Assemble packet
+        let assembled = '';
+        for (let i = 0; i <= lastIndex; i++) {
+          assembled += stream.get(i);
+        }
+        // Clear this stream
+        this.streams.delete(chunk.streamId);
+        this.streamComplete.delete(chunk.streamId);
+        return assembled.trimEnd();
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Clear all pending chunks
+   */
+  clear(): void {
+    this.streams.clear();
+    this.streamComplete.clear();
+  }
+}
