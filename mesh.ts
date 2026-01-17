@@ -327,14 +327,25 @@ export class MeshState {
 
     peer.lastSeen = Date.now();
 
+    // Check if we've already seen this packet (duplicate detection)
+    const isDuplicate = packet.t !== PACKET_TYPES.BEACON &&
+      peer.receivedPns.some(([start, end]) => packet.pn >= start && packet.pn <= end);
+
     // Track received pn (except for beacons which always have pn=0)
     if (packet.t !== PACKET_TYPES.BEACON) {
       peer.receivedPns = addToAckRanges(peer.receivedPns, packet.pn);
     }
 
-    // Process ACKs
+    // Process ACKs (always, even for duplicates)
     if (packet.acks && packet.acks.length > 0) {
       this.processAcks(peer, packet.acks);
+    }
+
+    // Skip processing if duplicate (but still ACK it)
+    if (isDuplicate && packet.t === PACKET_TYPES.DATA) {
+      // Re-queue ACK for duplicate
+      this.queueAck(peer);
+      return;
     }
 
     // Handle by type

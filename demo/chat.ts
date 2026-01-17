@@ -8,7 +8,7 @@
 import QRCode from 'qrcode';
 import { getOrCreateKeyPair, type KeyPair, type KeyStorage } from '../crypto';
 import { encodePacket, decodePacket, PACKET_TYPES } from '../protocol';
-import { QRScanner } from '../scanner';
+import { QRScanner, getScannerMode } from '../scanner';
 import { MeshState, type MeshEvent } from '../mesh';
 
 const styles = `
@@ -531,6 +531,8 @@ export class QRMeshChatElement extends HTMLElement {
           this.messageQueue = this.messageQueue.filter(m => m.id !== ackedMsg.id);
           this.updateQueueBadge();
           this.renderMessages();
+          // Update QR to show next pending message (or beacon if done)
+          this.updateQR();
         }
         this.updateDeliveryStatus();
         break;
@@ -631,6 +633,10 @@ export class QRMeshChatElement extends HTMLElement {
 
     const scanCountEl = this.shadow.getElementById('scan-count');
     const scanResultEl = this.shadow.getElementById('scan-result');
+    const scanModeEl = this.shadow.getElementById('scan-mode');
+
+    // Set scanner mode once
+    if (scanModeEl) scanModeEl.textContent = getScannerMode();
 
     this.scanDebugInterval = setInterval(() => {
       if (this.scanner) {
@@ -894,7 +900,8 @@ export class QRMeshChatElement extends HTMLElement {
             </div>
             <div class="scan-debug" id="scan-debug" style="font-size: 0.7rem; color: #64748b; padding: 0.25rem 0.5rem; background: #1e293b; border-radius: 0 0 0.5rem 0.5rem;">
               Scans: <span id="scan-count">0</span> |
-              Last: <span id="scan-result">waiting...</span>
+              Last: <span id="scan-result">waiting...</span> |
+              Mode: <span id="scan-mode">?</span>
             </div>
           </div>
         </div>
