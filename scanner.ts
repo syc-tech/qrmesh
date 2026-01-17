@@ -1,11 +1,24 @@
 /**
  * QR Scanner - Physical layer for QR code scanning
  *
- * This module handles camera access and QR code decoding using jsQR.
- * It's browser-specific but framework-agnostic.
+ * Uses native BarcodeDetector API when available (Chrome/Edge 88+, Safari 17.4+)
+ * for hardware-accelerated scanning. Falls back to jsQR for older browsers.
  */
 
 import jsQR from 'jsqr';
+
+// Check for native BarcodeDetector support
+const hasBarcodeDetector = typeof (window as any).BarcodeDetector !== 'undefined';
+let barcodeDetector: any = null;
+
+if (hasBarcodeDetector) {
+  try {
+    barcodeDetector = new (window as any).BarcodeDetector({ formats: ['qr_code'] });
+    console.log('[Scanner] Using native BarcodeDetector (hardware-accelerated)');
+  } catch (e) {
+    console.log('[Scanner] BarcodeDetector init failed, using jsQR fallback');
+  }
+}
 
 export interface ScanResult {
   data: string;
@@ -124,51 +137,70 @@ export class QRScanner {
   }
 
   /**
-   * Perform a single scan
+   * Perform a single scan - uses native BarcodeDetector if available
    */
-  private scan(): void {
-
+  private async scan(): Promise<void> {
     if (!this.video || !this.canvas || !this.ctx) return;
     if (this.video.readyState !== this.video.HAVE_ENOUGH_DATA) return;
 
-    // Update canvas size if video size changed
-    if (
-      this.canvas.width !== this.video.videoWidth ||
-      this.canvas.height !== this.video.videoHeight
-    ) {
-      this.canvas.width = this.video.videoWidth;
-      this.canvas.height = this.video.videoHeight;
+    let data: string | null = null;
+
+    // Try native BarcodeDetector first (much more reliable)
+    if (barcodeDetector && this.video) {
+      try {
+        const codes = await barcodeDetector.detect(this.video);
+        if (codes.length > 0) {
+          data = codes[0].rawValue;
+        }
+      } catch (e) {
+        // Fall through to jsQR
+      }
     }
 
-    // Draw video frame to canvas
-    this.ctx.drawImage(this.video, 0, 0);
+    // Fall back to jsQR
+    if (!data) {
+      // Update canvas size if video size changed
+      if (
+        this.canvas.width !== this.video.videoWidth ||
+        this.canvas.height !== this.video.videoHeight
+      ) {
+        this.canvas.width = this.video.videoWidth;
+        this.canvas.height = this.video.videoHeight;
+      }
 
-    // Get image data for QR detection
-    const imageData = this.ctx.getImageData(
-      0,
-      0,
-      this.canvas.width,
-      this.canvas.height
-    );
+      // Draw video frame to canvas
+      this.ctx.drawImage(this.video, 0, 0);
 
-    // Attempt to decode QR code
-    const code = jsQR(imageData.data, imageData.width, imageData.height, {
-      inversionAttempts: 'attemptBoth',
-    });
+      // Get image data for QR detection
+      const imageData = this.ctx.getImageData(
+        0,
+        0,
+        this.canvas.width,
+        this.canvas.height
+      );
 
-    if (code && code.data) {
+      const code = jsQR(imageData.data, imageData.width, imageData.height, {
+        inversionAttempts: 'attemptBoth',
+      });
+
+      if (code) {
+        data = code.data;
+      }
+    }
+
+    if (data) {
       const now = Date.now();
 
       // Debounce: don't report same QR code repeatedly
       if (
-        code.data !== this.lastScannedData ||
+        data !== this.lastScannedData ||
         now - this.lastScanTime > this.debounceMs
       ) {
-        this.lastScannedData = code.data;
+        this.lastScannedData = data;
         this.lastScanTime = now;
 
         this.onScan({
-          data: code.data,
+          data,
           timestamp: now,
         });
       }
